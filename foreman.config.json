@@ -1,0 +1,45 @@
+{
+  "projectName": "BUSHWAR — Grand Reef (fireforce)",
+  "repoUrl": "https://github.com/chazman69/fireforce.git",
+  "repoMarker": "map/addon.gproj",
+  "repoFolderName": "fireforce",
+  "workbenchLinkName": "Grand Reef",
+  "defaultBranch": "master",
+  "workbenchProcessPattern": "ArmaReforgerWork*",
+  "addonGuid": "69CA6AD9C662A5EF",
+  "terrain": {
+    "tileRegex": "^map/Worlds/GrandReef/GrandReef/\\.(Data|EditorData)/GrandReef_(\\d+)[._]",
+    "churnOnlyExtension": ".ttile",
+    "sculptSourceExtension": ".bterr",
+    "paintSourceMarker": "_layer",
+    "neverCommit": [
+      "map/resourceDatabase.rdb"
+    ],
+    "sharedRegenFiles": [
+      "map/Worlds/GrandReef/GrandReef/GrandReef.terr",
+      "map/Worlds/GrandReef/GrandReef/tileMap.conf",
+      "map/resourceDatabase.rdb"
+    ]
+  },
+  "layers": {
+    "layerFileRegex": "^map/Worlds/GrandReef/GrandReef_Layers/([^/]+)\\.layer$",
+    "sharedLayers": ["default", "Forests", "Vegetation", "Water", "Roads1", "Roads2", "Dirt1", "Dirt2", "Footpaths1", "Footpaths2"],
+    "stickFile": "collaboration/LAYER-STICK.md"
+  },
+  "prefabGuard": {
+    "layersFolder": "map/Worlds/GrandReef/GrandReef_Layers",
+    "minUnmatchedBare": 10,
+    "baseGameRoots": ["Prefabs", "PrefabLibrary", "PrefabsEditable", "Assets", "Configs", "Sounds", "UI", "Common", "Worlds", "Terrains", "Scripts", "Materials", "Textures", "Particles", "Characters", "Language"],
+    "extraAddonFolders": [],
+    "ignoreRoots": []
+  },
+  "backup": {
+    "remoteRefPrefix": "refs/backup",
+    "keepPerPerson": 60,
+    "autoMinutes": 30
+  },
+  "worldLockFile": "collaboration/WORLD-LOCK.md",
+  "prCompareUrl": "https://github.com/chazman69/fireforce/compare/master...{branch}?expand=1",
+  "docsUrl": "https://github.com/chazman69/fireforce/tree/master/collaboration",
+  "guideUrl": "https://github.com/chazman69/fireforce/blob/master/collaboration/builder-guide/BUSHWAR-Grand-Reef-Builders-Guide.pdf"
+}
