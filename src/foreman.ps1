@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.2'
+$script:ForemanVersion = '0.27.3'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -943,8 +943,16 @@ function Save-SafetySnapshot {
     $real = New-Object System.Collections.Generic.List[string]
     foreach ($n in @($Plan.RealTiles.Keys)) { foreach ($p in @($Plan.RealTiles[$n])) { $real.Add($p) } }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $idx = Join-Path $env:TEMP "foreman-safety-$PID.idx"
-    $list = Join-Path $env:TEMP "foreman-safety-$PID.txt"
+    # A git killed mid-snapshot (Foreman closed, PC slept) leaves <idx>.lock behind, and
+    # Windows reuses PIDs, so a $PID-only name later hit "Unable to create ...idx.lock:
+    # File exists" and stopped every ship (Hyrax, 2026-11-08). Unique name per call, and
+    # sweep leftovers older than a day.
+    Get-ChildItem -LiteralPath $env:TEMP -Filter 'foreman-safety-*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $tag = "$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $idx = Join-Path $env:TEMP "foreman-safety-$tag.idx"
+    $list = Join-Path $env:TEMP "foreman-safety-$tag.txt"
     $prevIdx = $env:GIT_INDEX_FILE
     try {
         $env:GIT_INDEX_FILE = $idx
@@ -966,7 +974,7 @@ function Save-SafetySnapshot {
         if (-not $tree) { throw 'write-tree returned nothing' }
     } finally {
         if ($prevIdx) { $env:GIT_INDEX_FILE = $prevIdx } else { Remove-Item Env:\GIT_INDEX_FILE -ErrorAction SilentlyContinue }
-        Remove-Item -LiteralPath $idx, $list -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $idx, "$idx.lock", $list -Force -ErrorAction SilentlyContinue
     }
     $r = Run-Git $repo @('-c', 'user.name=BUSHWAR Foreman', '-c', 'user.email=foreman@localhost',
         'commit-tree', $tree, '-p', 'HEAD', '-m', "Foreman safety snapshot ($Label) $stamp - $count file(s)")
