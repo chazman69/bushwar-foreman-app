@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.1'
+$script:ForemanVersion = '0.27.2'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -405,7 +405,8 @@ function Test-BaseGameReachable {
     foreach ($b in $AddonDirs) {
         if (-not $b -or -not (Test-Path -LiteralPath $b)) { continue }
         foreach ($g in @(Get-ChildItem -LiteralPath $b -Filter '*.gproj' -File -Recurse -Depth 1 -ErrorAction SilentlyContinue)) {
-            try { if ((Get-Content -LiteralPath $g.FullName -Raw -ErrorAction Stop) -match $script:BaseGameGuid) { return $true } } catch { }
+            # its OWN GUID line only: every map lists 58D0... under Dependencies (v0.27.1 matched that)
+            try { if ((Get-Content -LiteralPath $g.FullName -Raw -ErrorAction Stop) -match ('(?m)^\s*GUID\s+"' + $script:BaseGameGuid + '"')) { return $true } } catch { }
         }
     }
     return $false
@@ -3494,7 +3495,9 @@ if ($SmokeTest) {
     $dupMap = Test-IsMapProjectFolder $dMap
     $dupDep = Test-IsMapProjectFolder $dDep
     $dupNone = Test-IsMapProjectFolder $dNone
-    # base-game check: a pack alone isn't the base game; data\ArmaReforger.gproj one level down is
+    # base-game check: a pack alone isn't the base game, nor is a map that DEPENDS on it;
+    # data\ArmaReforger.gproj one level down is
+    "GameProject {`r`n ID `"GrandReef`"`r`n GUID `"$($script:Cfg.addonGuid)`"`r`n Dependencies {`r`n  `"$script:BaseGameGuid`" `"652412D10AC38900`"`r`n }`r`n}" | Out-File (Join-Path $dNone 'addon.gproj') -Encoding utf8
     $baseNo = Test-BaseGameReachable @($tmpRoot, (Join-Path $tmpRoot 'missing'))
     New-Item -ItemType Directory -Path (Join-Path $tmpRoot 'tools\data') -Force | Out-Null
     "GameProject {`r`n ID `"ArmaReforger`"`r`n GUID `"$script:BaseGameGuid`"`r`n}" | Out-File (Join-Path $tmpRoot 'tools\data\ArmaReforger.gproj') -Encoding utf8
