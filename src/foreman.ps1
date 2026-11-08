@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.0'
+$script:ForemanVersion = '0.27.1'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -392,6 +392,29 @@ function Find-WorkbenchExe {
     return $null
 }
 
+$script:BaseGameGuid = '58D0FB3206B6F859'   # ArmaReforger.gproj, the base game every map depends on
+
+function Test-BaseGameReachable {
+    # Pure (no Steam lookup) so it can be smoke-tested. Is the base game's project file in a
+    # folder Workbench searches on a -gproj launch? Those are its own .\addons and the
+    # Documents addons folder (the "Addon dirs" at the top of every Workbench log). A Tools
+    # install can lose it there (half-finished update, antivirus) while the project LAUNCHER
+    # still opens maps, because a builder added "Arma Reforger" to its project list by hand;
+    # a -gproj launch then dies with "Game addon '58D0...' not found" / "Can't initialize engine".
+    param([string[]]$AddonDirs)
+    foreach ($b in $AddonDirs) {
+        if (-not $b -or -not (Test-Path -LiteralPath $b)) { continue }
+        foreach ($g in @(Get-ChildItem -LiteralPath $b -Filter '*.gproj' -File -Recurse -Depth 1 -ErrorAction SilentlyContinue)) {
+            try { if ((Get-Content -LiteralPath $g.FullName -Raw -ErrorAction Stop) -match $script:BaseGameGuid) { return $true } } catch { }
+        }
+    }
+    return $false
+}
+
+function Get-WorkbenchAddonDirs([string]$exe) {
+    return @((Join-Path (Split-Path -Parent $exe) 'addons'), (Get-AddonsRoot))
+}
+
 function Get-WorkbenchProjectFile {
     # the addon.gproj AS WORKBENCH SEES IT: through the junction, so the path matches the
     # one in Workbench's own project list; the clone's own file as a fallback
@@ -413,6 +436,15 @@ function Open-Workbench {
     $exe = Find-WorkbenchExe
     if (-not $exe) {
         return @{ State = 'notfound'; Line = "[WARN] Foreman couldn't find Arma Reforger Tools. Open it from Steam yourself and choose Grand Reef. Press Doctor if it isn't installed." }
+    }
+    if (-not (Test-BaseGameReachable (Get-WorkbenchAddonDirs $exe))) {
+        # a direct launch can't start the engine on this PC; the project list can
+        try {
+            Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -ErrorAction Stop | Out-Null
+        } catch {
+            return @{ State = 'failed'; Line = "[WARN] Workbench didn't open ($($_.Exception.Message)). Open it from Steam yourself and choose Grand Reef." }
+        }
+        return @{ State = 'launcher'; Line = "[WARN] Your Arma Reforger Tools is missing the base game files, so Foreman can't open the map directly. The project list is opening instead: pick Grand Reef. To fix it for good: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity." }
     }
     $gproj = Get-WorkbenchProjectFile
     try {
@@ -2256,7 +2288,10 @@ function Invoke-Doctor([switch]$Interactive) {
     $results += (Repair-WorkbenchLink -Interactive:$Interactive).Lines
     $wbExe = $null
     try { $wbExe = Find-WorkbenchExe } catch { }
-    if ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
+    if ($wbExe -and -not (Test-BaseGameReachable (Get-WorkbenchAddonDirs $wbExe))) {
+        $results += "[WARN] Arma Reforger Tools is missing the base game files (Workbench would say 'Can't initialize engine'). START SESSION opens the project list instead: pick Grand Reef there. Fix: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity."
+    }
+    elseif ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
     # dependency prefabs (v0.25): do the prefabs the layers use actually exist on this machine?
     try { $results += (Get-DependencyWarnings).Lines }
@@ -2609,6 +2644,7 @@ function Update-NextHint {
         'notfound' { Set-Hint "NEXT >>  Open Arma Reforger Tools from Steam, then pick Grand Reef. (Doctor tells you if it's installed.)" '#e8c56a'; return }
         'failed' { Set-Hint "NEXT >>  Workbench didn't open. Open it from Steam, then pick Grand Reef." '#e8c56a'; return }
         'manual' { Set-Hint 'NEXT >>  Open Workbench and the Grand Reef world, then build.' '#8fd08f'; return }
+        'launcher' { Set-Hint 'NEXT >>  In the Workbench project list, pick Grand Reef and press Open, then build.' '#e8c56a'; return }
     }
     if ($script:Shippable -gt 0) {
         Set-Hint 'NEXT >>  SHIP SESSION  (you have work the team hasn''t got yet)' '#e8c56a'
@@ -3458,7 +3494,17 @@ if ($SmokeTest) {
     $dupMap = Test-IsMapProjectFolder $dMap
     $dupDep = Test-IsMapProjectFolder $dDep
     $dupNone = Test-IsMapProjectFolder $dNone
+    # base-game check: a pack alone isn't the base game; data\ArmaReforger.gproj one level down is
+    $baseNo = Test-BaseGameReachable @($tmpRoot, (Join-Path $tmpRoot 'missing'))
+    New-Item -ItemType Directory -Path (Join-Path $tmpRoot 'tools\data') -Force | Out-Null
+    "GameProject {`r`n ID `"ArmaReforger`"`r`n GUID `"$script:BaseGameGuid`"`r`n}" | Out-File (Join-Path $tmpRoot 'tools\data\ArmaReforger.gproj') -Encoding utf8
+    $baseYes = Test-BaseGameReachable @((Join-Path $tmpRoot 'tools'))
     Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "SMOKE: base game -> packs-only=$baseNo tools-data=$baseYes (expect False/True)"
+    if ($baseNo -or -not $baseYes) {
+        Write-Host 'SMOKE: BASE GAME CHECK FAILED'
+        exit 1
+    }
     Write-Host "SMOKE: dupe test -> map-copy=$dupMap dependency=$dupDep no-gproj=$dupNone (expect True/False/False)"
     if (-not $dupMap -or $dupDep -or $dupNone) {
         Write-Host 'SMOKE: DEPENDENCY SAFETY FAILED'
