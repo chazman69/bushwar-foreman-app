@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.3'
+$script:ForemanVersion = '0.27.4'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -665,6 +665,49 @@ function Test-RebaseInProgress([string]$repo) {
     return (Test-Path (Join-Path $gitDir 'rebase-merge')) -or (Test-Path (Join-Path $gitDir 'rebase-apply'))
 }
 
+function Test-SameLayerBody([string]$a, [string]$b) {
+    # Two .layer files are the same work if they match once Workbench's regenerated header
+    # lines are ignored: BSP (the spatial index), boundMins, boundMaxs - all near the top of
+    # the file and rewritten on every save. Streams both files (vegetation layers are ~90 MB).
+    $hdr = '^\s*(BSP|boundMins|boundMaxs)(\s|$)'
+    $ra = New-Object System.IO.StreamReader($a)
+    $rb = New-Object System.IO.StreamReader($b)
+    try {
+        $na = 0; $nb = 0
+        while ($true) {
+            do { $la = $ra.ReadLine(); $na++ } while ($la -ne $null -and $na -le 12 -and $la -match $hdr)
+            do { $lb = $rb.ReadLine(); $nb++ } while ($lb -ne $null -and $nb -le 12 -and $lb -match $hdr)
+            if ($la -eq $null -or $lb -eq $null) { return ($la -eq $null -and $lb -eq $null) }
+            if ($la -cne $lb) { return $false }
+        }
+    } finally { $ra.Dispose(); $rb.Dispose() }
+}
+
+function Get-HeaderOnlyLayerSide([string]$repo, [string]$path) {
+    # A rebase paused on a conflicted .layer. Returns 'theirs' (the builder's own commit)
+    # when master's side only changed the header, 'ours' (master) when the builder's side
+    # only changed the header, or $null when both sides really changed it (a human picks).
+    $r = Run-Git $repo @('checkout-index', '--stage=all', '--temp', '--', $path)
+    if ($r.Code -ne 0 -or $r.Out -notmatch '^(\S+) (\S+) (\S+)\t') { return $null }
+    $tmp = @($Matches[1], $Matches[2], $Matches[3])
+    $full = @($tmp | ForEach-Object { if ($_ -eq '.') { $null } else { Join-Path $repo $_ } })
+    try {
+        $base = $full[0]; $ours = $full[1]; $theirs = $full[2]
+        if (-not $ours -or -not $theirs) { return $null }               # one side deleted it: a human picks
+        if (-not $base) {                                               # both added it
+            if (Test-SameLayerBody $ours $theirs) { return 'ours' }
+            return $null
+        }
+        if (Test-SameLayerBody $ours $base) { return 'theirs' }         # master: header-only
+        if (Test-SameLayerBody $theirs $base) { return 'ours' }         # builder: header-only
+        return $null
+    } catch {
+        return $null
+    } finally {
+        foreach ($f in $full) { if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
+    }
+}
+
 function Resolve-SharedRebase([string]$repo, [string]$master) {
     # A rebase has paused on conflict. Proven merge model (collaboration/terrain-sculpting.md,
     # verified live in PR #82): sculpt geometry lives in disjoint per-tile files and never
@@ -676,6 +719,7 @@ function Resolve-SharedRebase([string]$repo, [string]$master) {
     # or — more often now — the same world layer) — that's the one human hard-stop.
     $shared = @($script:Cfg.terrain.sharedRegenFiles)
     $resolved = @{}
+    $layers = @{}
     $guard = 0
     while (Test-RebaseInProgress $repo) {
         if ($guard++ -gt 200) { return @{ Ok = $false; Bad = @('(rebase did not converge)') } }
@@ -683,9 +727,22 @@ function Resolve-SharedRebase([string]$repo, [string]$master) {
         $unmerged = @()
         if ($u) { $unmerged = @($u -split "`r?`n" | Where-Object { $_ }) }
         if ($unmerged.Count -gt 0) {
-            $bad = @($unmerged | Where-Object { $shared -notcontains $_ })
+            # v0.27.4: a world layer where one side changed ONLY Workbench's regenerated
+            # header (BSP / boundMins / boundMaxs) isn't a real clash - keep the side with
+            # the real edits (Malvia vs Hyrax on default.layer, 2026-11-09).
+            $layerPicked = @{}   # path -> side kept, for this paused commit
+            foreach ($p in @($unmerged | Where-Object { $shared -notcontains $_ -and $_ -like '*.layer' })) {
+                $side = Get-HeaderOnlyLayerSide $repo $p
+                if ($side) {
+                    Run-Git $repo @('checkout', "--$side", '--', $p) | Out-Null
+                    Run-Git $repo @('add', '--', $p) | Out-Null
+                    $layerPicked[$p] = $side
+                }
+            }
+            $bad = @($unmerged | Where-Object { $shared -notcontains $_ -and -not $layerPicked.ContainsKey($_) })
             if ($bad.Count -gt 0) { return @{ Ok = $false; Bad = $bad } }
-            foreach ($p in $unmerged) {
+            foreach ($k in $layerPicked.Keys) { $layers[$k] = $layerPicked[$k] }
+            foreach ($p in @($unmerged | Where-Object { -not $layerPicked.ContainsKey($_) })) {
                 Run-Git $repo @('checkout', '--ours', '--', $p) | Out-Null   # --ours == master during a rebase
                 Run-Git $repo @('add', '--', $p) | Out-Null
                 $resolved[$p] = 1
@@ -709,7 +766,7 @@ function Resolve-SharedRebase([string]$repo, [string]$master) {
             }
         }
     }
-    return @{ Ok = $true; Resolved = @($resolved.Keys) }
+    return @{ Ok = $true; Resolved = @($resolved.Keys); Layers = $layers }
 }
 
 function Get-RepoState {
@@ -800,6 +857,10 @@ function Invoke-StartSession {
             if ($res.Resolved.Count -gt 0) {
                 $names = ($res.Resolved | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
                 $notes += "[FIX] auto-merged $($res.Resolved.Count) shared index file(s) while landing leftover work (master wins, Workbench regenerates them; your sculpts untouched): $names"
+            }
+            if ($res.Layers -and $res.Layers.Count -gt 0) {
+                $names = ($res.Layers.Keys | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+                $notes += "[FIX] $names clashed only in Workbench's auto-generated header (BSP/bounds) - kept the side with the real edits, nothing lost; Workbench rebuilds the header on next save."
             }
         }
         $r = Run-Git $repo @('push', 'origin', $script:Cfg.defaultBranch)
@@ -2164,6 +2225,10 @@ function Invoke-Ship {
             if ($res.Resolved.Count -gt 0) {
                 $names = ($res.Resolved | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
                 $notes += "[FIX] auto-merged $($res.Resolved.Count) shared index file(s) with the team (master wins, Workbench regenerates them on next save; your sculpts untouched): $names"
+            }
+            if ($res.Layers -and $res.Layers.Count -gt 0) {
+                $names = ($res.Layers.Keys | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+                $notes += "[FIX] $names clashed only in Workbench's auto-generated header (BSP/bounds) - kept the side with the real edits, nothing lost; Workbench rebuilds the header on next save."
             }
         }
         # stick GATE, second look: did someone tap in while we were shipping? (the pull
