@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.8'
+$script:ForemanVersion = '0.27.9'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -449,12 +449,55 @@ function Get-RecentWorkbenchLogTexts([int]$Count = 3) {
     return $out
 }
 
+function Test-LogIsForMap {
+    # Pure so it can be smoke-tested. Is this Workbench log from a start of THIS map? v0.27.9:
+    # builders open other projects too (their own maps), and a failed start of one of those
+    # (e.g. missing ArmaTerrainCore, which Grand Reef doesn't use) was blamed on the map.
+    # A log counts when it names the map's GUID, its project ID, or (an early failure may
+    # print nothing else) the project file Foreman launched, in either slash style.
+    param([string]$Text, [string]$Guid, [string]$ProjectId, [string[]]$Paths = @())
+    if (-not $Text) { return $false }
+    if ($Guid -and $Text.IndexOf($Guid, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    foreach ($p in $Paths) {
+        if (-not $p) { continue }
+        foreach ($v in @(($p -replace '/', '\'), ($p -replace '\\', '/'))) {
+            if ($Text.IndexOf($v, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+        }
+    }
+    if ($ProjectId -and $Text -match ('(?i)(?<![A-Za-z0-9_])' + [regex]::Escape($ProjectId) + '(?![A-Za-z0-9_])')) { return $true }
+    return $false
+}
+
+function Get-MapProjectId {
+    # the ID line of the map's addon.gproj (e.g. GrandReef), or '' if unreadable
+    try {
+        $m = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $script:MapRepo 'map\addon.gproj')), '(?m)^\s*ID\s+"([^"]+)"')
+        if ($m.Success) { return $m.Groups[1].Value }
+    } catch { }
+    return ''
+}
+
+function Get-NewestMapLogText {
+    # The newest of the last few Workbench logs that is from a start of this map ('' if none).
+    $id = Get-MapProjectId
+    $paths = @()
+    try {
+        $gp = Get-WorkbenchProjectFile
+        # the folder + file tail ("Grand Reef\addon.gproj"): the drive/user part of the path
+        # may be printed differently (OneDrive, junction vs clone)
+        $paths += (Join-Path (Split-Path (Split-Path $gp -Parent) -Leaf) (Split-Path $gp -Leaf))
+    } catch { }
+    foreach ($t in @(Get-RecentWorkbenchLogTexts 5)) {
+        if (Test-LogIsForMap -Text $t -Guid $script:Cfg.addonGuid -ProjectId $id -Paths $paths) { return $t }
+    }
+    return ''
+}
+
 function Test-WorkbenchNeedsLauncher {
     # Open the project list instead of a direct -gproj launch only when the LAST Workbench
-    # run failed to start the engine. No log / clean log = launch directly. Newest log only
-    # (v0.27.8): once the builder fixes the cause, one good start clears it - with the newest
-    # three, an old failure kept a fixed PC on the project list for up to three more starts.
-    try { return (Test-BaseGameLaunchFailed (Get-RecentWorkbenchLogTexts 1)) } catch { return $false }
+    # start OF THIS MAP failed to start the engine (v0.27.9: other projects' logs don't
+    # count). No log / clean log = launch directly; one good start clears it (v0.27.8).
+    try { return (Test-BaseGameLaunchFailed @(Get-NewestMapLogText)) } catch { return $false }
 }
 
 function Get-WorkbenchProjectFile {
@@ -2647,7 +2690,7 @@ function Invoke-Doctor([switch]$Interactive) {
     try { $wbExe = Find-WorkbenchExe } catch { }
     if ($wbExe -and (Test-WorkbenchNeedsLauncher)) {
         $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. The usual cause is a missing addon - the map's own, or one a pack needs (Workbench's log lines below name it; download it from the Workshop). Otherwise Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity. Until then START SESSION opens the project list: pick Grand Reef there."
-        try { foreach ($fl in @(Get-LaunchFailureLines (Get-RecentWorkbenchLogTexts 1))) { $results += "[INFO]   Workbench's log: $fl" } } catch { }
+        try { foreach ($fl in @(Get-LaunchFailureLines @(Get-NewestMapLogText))) { $results += "[INFO]   Workbench's log: $fl" } } catch { }
     }
     elseif ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
@@ -3924,6 +3967,24 @@ if ($SmokeTest) {
     Write-Host "SMOKE: launch failure lines -> $($fl -join ' | ') ok=$flOk (expect the ArmaTerrainCore line only, ok=True)"
     if (-not $flOk) {
         Write-Host 'SMOKE: LAUNCH FAILURE LINES FAILED'
+        exit 1
+    }
+    # whose log is it (v0.27.9): another project's failed start never counts against the map
+    $mg = $script:Cfg.addonGuid
+    $logOther = "ENGINE: Loading project 'C:/Users/x/Documents/My Games/ArmaReforgerWorkbench/addons/Mashonaland/Mashonaland.gproj'`r`n$flLog"
+    $logGuid = "RESOURCES: Addon: GrandReef ($mg)`r`n$badB"
+    $logId = "ENGINE: project GrandReef`r`n$badB"
+    $logPath = "ENGINE: -gproj C:/Users/x/Documents/My Games/ArmaReforgerWorkbench/addons/Grand Reef/addon.gproj`r`n$badB"
+    $logIdPart = "ENGINE: project GrandReefTest`r`n$badB"
+    $wOther = Test-LogIsForMap -Text $logOther -Guid $mg -ProjectId 'GrandReef' -Paths @('Grand Reef\addon.gproj')
+    $wGuid = Test-LogIsForMap -Text $logGuid -Guid $mg -ProjectId 'GrandReef'
+    $wId = Test-LogIsForMap -Text $logId -Guid $mg -ProjectId 'GrandReef'
+    $wPath = Test-LogIsForMap -Text $logPath -Guid $mg -ProjectId 'GrandReef' -Paths @('Grand Reef\addon.gproj')
+    $wIdPart = Test-LogIsForMap -Text $logIdPart -Guid $mg -ProjectId 'GrandReef'
+    $whoOk = (-not $wOther -and $wGuid -and $wId -and $wPath -and -not $wIdPart)
+    Write-Host "SMOKE: whose log -> other-map=$wOther guid=$wGuid id=$wId gproj-path=$wPath id-prefix=$wIdPart (expect False/True/True/True/False)"
+    if (-not $whoOk) {
+        Write-Host 'SMOKE: LOG OWNER CHECK FAILED'
         exit 1
     }
     # map dependencies (v0.27.7): a Workshop folder named _<GUID> and a loose addon's own GUID
