@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.28.0'
+$script:ForemanVersion = '0.28.1'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -360,8 +360,8 @@ function Repair-WorkbenchLink([switch]$Interactive) {
     return @{ Ok = $ok; Lines = $lines }
 }
 
-function Find-WorkbenchExe {
-    # Arma Reforger Tools, in any Steam library on this PC (registry + libraryfolders.vdf)
+function Get-SteamLibraries {
+    # every Steam library folder on this PC (registry + libraryfolders.vdf + the defaults)
     $libs = @()
     try {
         $sp = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath
@@ -378,9 +378,18 @@ function Find-WorkbenchExe {
     } catch { }
     foreach ($pf in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) { if ($pf) { $libs += (Join-Path $pf 'Steam') } }
     $seen = @{}
+    $out = @()
     foreach ($lib in $libs) {
         if (-not $lib -or $seen.ContainsKey($lib.ToLower())) { continue }
         $seen[$lib.ToLower()] = 1
+        $out += $lib
+    }
+    return $out
+}
+
+function Find-WorkbenchExe {
+    # Arma Reforger Tools, in any Steam library on this PC
+    foreach ($lib in (Get-SteamLibraries)) {
         $dir = Join-Path $lib 'steamapps\common\Arma Reforger Tools'
         if (-not (Test-Path $dir)) { continue }
         # Steam's own launch option is the SteamDiag build; take it when present
@@ -393,6 +402,41 @@ function Find-WorkbenchExe {
 }
 
 $script:BaseGameGuid = '58D0FB3206B6F859'   # ArmaReforger.gproj, the base game every map depends on
+
+# v0.28.1 - the real cause of "Game addon '58D0...' not found" (builder diagnostics,
+# 2026-11-10): on some PCs Arma Reforger Tools ships only addons\core; the base game
+# (addons\data\ArmaReforger.gproj) lives in the GAME install, steamapps\common\Arma
+# Reforger\addons. The Workbench launcher searches it (it's in the launcher's settings),
+# but a bare -gproj launch only searches .\addons and Documents\...\ArmaReforgerWorkbench\
+# addons, so Foreman's direct launch died while the project list worked. Foreman now
+# passes -addonsDir with the game's addons folder when Tools has no base game of its own.
+function Find-GameAddonsDir {
+    # the Arma Reforger (game) install's addons folder, when it holds the base game
+    foreach ($lib in (Get-SteamLibraries)) {
+        $a = Join-Path $lib 'steamapps\common\Arma Reforger\addons'
+        if (Test-Path -LiteralPath (Join-Path $a 'data\ArmaReforger.gproj')) { return $a }
+    }
+    return $null
+}
+
+function Get-WorkbenchAddonsDirs {
+    # Pure so it can be smoke-tested: the -addonsDir list for a direct launch, or @() when
+    # Tools' own addons folder already has the base game (or the game can't be found).
+    param([string]$ToolsAddons, [string]$GameAddons, [string]$DocsAddons)
+    if (-not $GameAddons) { return @() }
+    if ($ToolsAddons -and (Test-Path -LiteralPath (Join-Path $ToolsAddons 'data\ArmaReforger.gproj'))) { return @() }
+    return @(@($ToolsAddons, $GameAddons, $DocsAddons) | Where-Object { $_ })
+}
+
+function Get-WorkbenchLaunchArgs {
+    # -gproj <map>, plus -addonsDir "<tools>,<game>,<documents>" when the base game is
+    # only in the game install
+    param([string]$Exe, [string]$Gproj)
+    $args2 = @('-gproj', "`"$Gproj`"")
+    $dirs = @(Get-WorkbenchAddonsDirs -ToolsAddons (Join-Path (Split-Path -Parent $Exe) 'addons') -GameAddons (Find-GameAddonsDir) -DocsAddons (Get-AddonsRoot))
+    if ($dirs.Count -gt 0) { $args2 += @('-addonsDir', "`"$($dirs -join ',')`"") }
+    return $args2
+}
 
 function Test-BaseGameLaunchFailed {
     # Pure so it can be smoke-tested. Did a Workbench run die because the engine couldn't
@@ -497,7 +541,22 @@ function Test-WorkbenchNeedsLauncher {
     # Open the project list instead of a direct -gproj launch only when the LAST Workbench
     # start OF THIS MAP failed to start the engine (v0.27.9: other projects' logs don't
     # count). No log / clean log = launch directly; one good start clears it (v0.27.8).
-    try { return (Test-BaseGameLaunchFailed @(Get-NewestMapLogText)) } catch { return $false }
+    # v0.28.1: a failure from a launch WITHOUT -addonsDir doesn't count once Foreman can now
+    # pass one (the game install holds the base game) - that is exactly what it fixes.
+    try {
+        $t = Get-NewestMapLogText
+        if (-not (Test-BaseGameLaunchFailed @($t))) { return $false }
+        return -not (Test-AddonsDirWouldFix -LogText $t)
+    } catch { return $false }
+}
+
+function Test-AddonsDirWouldFix {
+    # the failed log's launch had no -addonsDir, and this PC's launch would now add one
+    param([string]$LogText)
+    if ($LogText -match '(?im)CLI Params:.*-addonsDir') { return $false }
+    $exe = Find-WorkbenchExe
+    if (-not $exe) { return $false }
+    return (@(Get-WorkbenchLaunchArgs -Exe $exe -Gproj 'x') -contains '-addonsDir')
 }
 
 function Get-WorkbenchProjectFile {
@@ -533,7 +592,7 @@ function Open-Workbench {
     }
     $gproj = Get-WorkbenchProjectFile
     try {
-        Start-Process -FilePath $exe -ArgumentList @('-gproj', "`"$gproj`"") -WorkingDirectory (Split-Path -Parent $exe) -ErrorAction Stop | Out-Null
+        Start-Process -FilePath $exe -ArgumentList (Get-WorkbenchLaunchArgs -Exe $exe -Gproj $gproj) -WorkingDirectory (Split-Path -Parent $exe) -ErrorAction Stop | Out-Null
     } catch {
         return @{ State = 'failed'; Line = "[WARN] Workbench didn't open ($($_.Exception.Message)). Open it from Steam yourself and choose Grand Reef." }
     }
@@ -2840,7 +2899,13 @@ function Invoke-Doctor([switch]$Interactive) {
         $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. The usual cause is a missing addon - the map's own, or one a pack needs (Workbench's log lines below name it; download it from the Workshop). Otherwise Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity. Until then START SESSION opens the project list: pick Grand Reef there."
         try { foreach ($fl in @(Get-LaunchFailureLines @(Get-NewestMapLogText))) { $results += "[INFO]   Workbench's log: $fl" } } catch { }
     }
-    elseif ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
+    elseif ($wbExe) {
+        $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)'
+        try {
+            $la = @(Get-WorkbenchLaunchArgs -Exe $wbExe -Gproj 'x')
+            if ($la -contains '-addonsDir') { $results += "[OK]   Base game found in the Arma Reforger install ($(Find-GameAddonsDir)) - Foreman points Workbench at it" }
+        } catch { }
+    }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
     # map dependencies (v0.27.7): is every addon the map's addon.gproj lists installed?
     try { $results += @(Get-MissingDependencyLines) }
@@ -4191,6 +4256,26 @@ if ($SmokeTest) {
     Write-Host "SMOKE: whose log -> other-map=$wOther guid=$wGuid id=$wId gproj-path=$wPath id-prefix=$wIdPart (expect False/True/True/True/False)"
     if (-not $whoOk) {
         Write-Host 'SMOKE: LOG OWNER CHECK FAILED'
+        exit 1
+    }
+    # -addonsDir (v0.28.1): added only when Tools lacks the base game and the game install has it
+    $adT = Join-Path $env:TEMP "foreman-addonsdir-$PID"
+    $toolsA = Join-Path $adT 'Tools\Workbench\addons'; $gameA = Join-Path $adT 'Arma Reforger\addons'; $docsA = Join-Path $adT 'Docs\addons'
+    New-Item -ItemType Directory -Path (Join-Path $toolsA 'core'), (Join-Path $gameA 'data'), $docsA -Force | Out-Null
+    'GameProject { GUID "58D0FB3206B6F859" }' | Out-File (Join-Path $gameA 'data\ArmaReforger.gproj') -Encoding ascii
+    $adNeed = @(Get-WorkbenchAddonsDirs -ToolsAddons $toolsA -GameAddons $gameA -DocsAddons $docsA)
+    $adNoGame = @(Get-WorkbenchAddonsDirs -ToolsAddons $toolsA -GameAddons $null -DocsAddons $docsA)
+    New-Item -ItemType Directory -Path (Join-Path $toolsA 'data') -Force | Out-Null
+    'GameProject { GUID "58D0FB3206B6F859" }' | Out-File (Join-Path $toolsA 'data\ArmaReforger.gproj') -Encoding ascii
+    $adToolsHas = @(Get-WorkbenchAddonsDirs -ToolsAddons $toolsA -GameAddons $gameA -DocsAddons $docsA)
+    Remove-Item $adT -Recurse -Force -ErrorAction SilentlyContinue
+    $cliOld = '12:53:58.342   ENGINE       : CLI Params: -gproj C:\x\Grand Reef\addon.gproj '
+    $cliNew = '12:53:58.342   ENGINE       : CLI Params: -gproj C:\x\Grand Reef\addon.gproj -addonsDir C:\a,C:\b '
+    $adOk = ($adNeed.Count -eq 3 -and $adNeed[1] -eq $gameA -and $adNoGame.Count -eq 0 -and $adToolsHas.Count -eq 0 -and
+             $cliOld -notmatch '(?im)CLI Params:.*-addonsDir' -and $cliNew -match '(?im)CLI Params:.*-addonsDir')
+    Write-Host "SMOKE: addonsDir -> tools-lacks-base=$($adNeed.Count) no-game=$($adNoGame.Count) tools-has-base=$($adToolsHas.Count) ok=$adOk (expect 3/0/0 ok=True)"
+    if (-not $adOk) {
+        Write-Host 'SMOKE: ADDONSDIR CHECK FAILED'
         exit 1
     }
     # map dependencies (v0.27.7): a Workshop folder named _<GUID> and a loose addon's own GUID
