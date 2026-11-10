@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.5'
+$script:ForemanVersion = '0.27.6'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -394,26 +394,44 @@ function Find-WorkbenchExe {
 
 $script:BaseGameGuid = '58D0FB3206B6F859'   # ArmaReforger.gproj, the base game every map depends on
 
-function Test-BaseGameReachable {
-    # Pure (no Steam lookup) so it can be smoke-tested. Is the base game's project file in a
-    # folder Workbench searches on a -gproj launch? Those are its own .\addons and the
-    # Documents addons folder (the "Addon dirs" at the top of every Workbench log). A Tools
-    # install can lose it there (half-finished update, antivirus) while the project LAUNCHER
-    # still opens maps, because a builder added "Arma Reforger" to its project list by hand;
-    # a -gproj launch then dies with "Game addon '58D0...' not found" / "Can't initialize engine".
-    param([string[]]$AddonDirs)
-    foreach ($b in $AddonDirs) {
-        if (-not $b -or -not (Test-Path -LiteralPath $b)) { continue }
-        foreach ($g in @(Get-ChildItem -LiteralPath $b -Filter '*.gproj' -File -Recurse -Depth 1 -ErrorAction SilentlyContinue)) {
-            # its OWN GUID line only: every map lists 58D0... under Dependencies (v0.27.1 matched that)
-            try { if ((Get-Content -LiteralPath $g.FullName -Raw -ErrorAction Stop) -match ('(?m)^\s*GUID\s+"' + $script:BaseGameGuid + '"')) { return $true } } catch { }
-        }
-    }
+function Test-BaseGameLaunchFailed {
+    # Pure so it can be smoke-tested. Did a Workbench run die because the engine couldn't
+    # find the base game ("Game addon '58D0...' not found" / "Can't initialize engine")?
+    # v0.27.6: this is EVIDENCE from Workbench's own logs. v0.27.1-v0.27.5 guessed from the
+    # Tools folder layout instead, and that guess said "missing base game files" on PCs
+    # whose Tools worked fine (two builders), then sent them to the project list.
+    param([string[]]$LogTexts)
+    $sig = "(?i)can'?t\s+initiali[sz]e\s+engine|game\s+addon\W{0,3}$($script:BaseGameGuid)\W{0,3}\s*not\s+found"
+    foreach ($t in $LogTexts) { if ($t -and $t -match $sig) { return $true } }
     return $false
 }
 
-function Get-WorkbenchAddonDirs([string]$exe) {
-    return @((Join-Path (Split-Path -Parent $exe) 'addons'), (Get-AddonsRoot))
+function Get-RecentWorkbenchLogTexts([int]$Count = 3) {
+    # The start of the newest few Workbench console logs (engine start-up is at the top,
+    # and some logs run to hundreds of MB, so only the first 2 MB of each is read).
+    $dir = Join-Path (Get-DocumentsDir) 'My Games\ArmaReforgerWorkbench\logs'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter 'console*.log' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First $Count)
+    $out = @()
+    foreach ($f in $files) {
+        try {
+            $fs = New-Object System.IO.FileStream($f.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $sr = New-Object System.IO.StreamReader($fs)
+                $buf = New-Object char[] (2MB)
+                $n = $sr.ReadBlock($buf, 0, $buf.Length)
+                $out += (New-Object string($buf, 0, $n))
+            } finally { $fs.Dispose() }
+        } catch { }
+    }
+    return $out
+}
+
+function Test-WorkbenchNeedsLauncher {
+    # Open the project list instead of a direct -gproj launch only when a recent Workbench
+    # run actually failed to start the engine. No logs / clean logs = launch directly.
+    try { return (Test-BaseGameLaunchFailed (Get-RecentWorkbenchLogTexts)) } catch { return $false }
 }
 
 function Get-WorkbenchProjectFile {
@@ -438,14 +456,14 @@ function Open-Workbench {
     if (-not $exe) {
         return @{ State = 'notfound'; Line = "[WARN] Foreman couldn't find Arma Reforger Tools. Open it from Steam yourself and choose Grand Reef. Press Doctor if it isn't installed." }
     }
-    if (-not (Test-BaseGameReachable (Get-WorkbenchAddonDirs $exe))) {
-        # a direct launch can't start the engine on this PC; the project list can
+    if (Test-WorkbenchNeedsLauncher) {
+        # a recent direct launch couldn't start the engine on this PC; the project list can
         try {
             Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -ErrorAction Stop | Out-Null
         } catch {
             return @{ State = 'failed'; Line = "[WARN] Workbench didn't open ($($_.Exception.Message)). Open it from Steam yourself and choose Grand Reef." }
         }
-        return @{ State = 'launcher'; Line = "[WARN] Your Arma Reforger Tools is missing the base game files, so Foreman can't open the map directly. The project list is opening instead: pick Grand Reef. To fix it for good: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity." }
+        return @{ State = 'launcher'; Line = "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine', so the project list is opening instead: pick Grand Reef. If that keeps happening: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity." }
     }
     $gproj = Get-WorkbenchProjectFile
     try {
@@ -2540,8 +2558,8 @@ function Invoke-Doctor([switch]$Interactive) {
     $results += (Repair-WorkbenchLink -Interactive:$Interactive).Lines
     $wbExe = $null
     try { $wbExe = Find-WorkbenchExe } catch { }
-    if ($wbExe -and -not (Test-BaseGameReachable (Get-WorkbenchAddonDirs $wbExe))) {
-        $results += "[WARN] Arma Reforger Tools is missing the base game files (Workbench would say 'Can't initialize engine'). START SESSION opens the project list instead: pick Grand Reef there. Fix: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity."
+    if ($wbExe -and (Test-WorkbenchNeedsLauncher)) {
+        $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. START SESSION opens the project list instead: pick Grand Reef there. If it keeps happening: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity."
     }
     elseif ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
@@ -3792,16 +3810,19 @@ if ($SmokeTest) {
     $dupMap = Test-IsMapProjectFolder $dMap
     $dupDep = Test-IsMapProjectFolder $dDep
     $dupNone = Test-IsMapProjectFolder $dNone
-    # base-game check: a pack alone isn't the base game, nor is a map that DEPENDS on it;
-    # data\ArmaReforger.gproj one level down is
-    "GameProject {`r`n ID `"GrandReef`"`r`n GUID `"$($script:Cfg.addonGuid)`"`r`n Dependencies {`r`n  `"$script:BaseGameGuid`" `"652412D10AC38900`"`r`n }`r`n}" | Out-File (Join-Path $dNone 'addon.gproj') -Encoding utf8
-    $baseNo = Test-BaseGameReachable @($tmpRoot, (Join-Path $tmpRoot 'missing'))
-    New-Item -ItemType Directory -Path (Join-Path $tmpRoot 'tools\data') -Force | Out-Null
-    "GameProject {`r`n ID `"ArmaReforger`"`r`n GUID `"$script:BaseGameGuid`"`r`n}" | Out-File (Join-Path $tmpRoot 'tools\data\ArmaReforger.gproj') -Encoding utf8
-    $baseYes = Test-BaseGameReachable @((Join-Path $tmpRoot 'tools'))
     Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "SMOKE: base game -> packs-only=$baseNo tools-data=$baseYes (expect False/True)"
-    if ($baseNo -or -not $baseYes) {
+    # base-game launch check (v0.27.6): only a log that shows the engine failing counts. A
+    # healthy log, one that merely names the base game GUID as a dependency, or no log at
+    # all = launch directly.
+    $okLog = "12:00:01.000 ENGINE       : Addon dirs:`r`n  dir: 'C:/Steam/steamapps/common/Arma Reforger Tools/Workbench/addons/'`r`n12:00:02.000 RESOURCES    : Addon: ArmaReforger ($script:BaseGameGuid)`r`n12:00:09.000 ENGINE       : Game successfully created."
+    $badA = "12:00:01.000 ENGINE    (E): Game addon '$script:BaseGameGuid' not found!"
+    $badB = "12:00:01.000 ENGINE    (F): Can't initialize engine"
+    $lHealthy = Test-BaseGameLaunchFailed @($okLog)
+    $lNone = Test-BaseGameLaunchFailed @()
+    $lAddon = Test-BaseGameLaunchFailed @($okLog, $badA)
+    $lEngine = Test-BaseGameLaunchFailed @($badB)
+    Write-Host "SMOKE: base game -> healthy=$lHealthy no-logs=$lNone addon-missing=$lAddon cant-init=$lEngine (expect False/False/True/True)"
+    if ($lHealthy -or $lNone -or -not $lAddon -or -not $lEngine) {
         Write-Host 'SMOKE: BASE GAME CHECK FAILED'
         exit 1
     }
