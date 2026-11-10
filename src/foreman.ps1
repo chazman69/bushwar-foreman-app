@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.4'
+$script:ForemanVersion = '0.27.5'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -875,7 +875,7 @@ function Invoke-StartSession {
     # ship-time PREFAB GUARD is the real protection).
     try {
         $dep = Get-DependencyWarnings
-        if ($dep.Missing -gt 0) { $notes += $dep.Summary }
+        if ($dep.Summary) { $notes += $dep.Summary }
     } catch { }
 
     return @{ Branch = $script:Cfg.defaultBranch; Notes = $notes }
@@ -1217,11 +1217,133 @@ function Invoke-AutoBackup {
 $script:LayerScanSource = @'
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Bushwar
 {
+    // v0.27.5: file list of a packed (Workshop) addon. Workshop downloads arrive as an
+    // Enfusion PAC1 archive (data.pak), not loose files, so the dependency check could
+    // never see them and named every props pack "missing". Layout: "FORM" <size BE>
+    // "PAC1", then chunks of <4-char id><size> (HEAD, DATA, FILE). FILE holds the tree:
+    // entry = <type: 0 dir, 1 file><name length><name>, then a dir has <child count LE>
+    // and its children, a file a fixed block (offset, sizes, flags, time). Only the names
+    // are needed. The fixed block size and the chunk-size endianness are not hardcoded:
+    // each candidate is tried and only a parse that consumes the FILE chunk EXACTLY,
+    // with sane names, is accepted - anything else throws, and Doctor then says it
+    // couldn't check instead of crying "missing".
+    public static class PakIndex
+    {
+        static readonly int[] FileBlockSizes = { 24, 20, 28, 16, 32 };
+
+        static uint BE(byte[] b, int o) { return (uint)((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]); }
+        static uint LE(byte[] b, int o) { return (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)); }
+
+        static int ReadFull(Stream s, byte[] buf, int n)
+        {
+            int got = 0;
+            while (got < n) { int r = s.Read(buf, got, n - got); if (r <= 0) break; got += r; }
+            return got;
+        }
+
+        static bool IsChunkId(byte[] b)
+        {
+            for (int k = 0; k < 4; k++) { byte c = b[k]; if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false; }
+            return true;
+        }
+
+        // Addon-relative paths ("Commercial/Prefabs/x.et") of every file in the pak.
+        public static List<string> Files(string path)
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                long len = fs.Length;
+                byte[] h = new byte[12];
+                if (ReadFull(fs, h, 12) != 12) throw new InvalidDataException("file too short");
+                if (Encoding.ASCII.GetString(h, 0, 4) != "FORM" || Encoding.ASCII.GetString(h, 8, 4) != "PAC1")
+                    throw new InvalidDataException("not an Enfusion PAC1 pak");
+                long pos = 12;
+                byte[] ch = new byte[8];
+                bool retried = false;
+                while (pos + 8 <= len)
+                {
+                    fs.Position = pos;
+                    if (ReadFull(fs, ch, 8) != 8) break;
+                    if (!IsChunkId(ch))
+                    {
+                        if (retried) throw new InvalidDataException("lost chunk alignment at byte " + pos);
+                        retried = true; pos++; continue;      // IFF-style pad byte after an odd chunk
+                    }
+                    retried = false;
+                    string id = Encoding.ASCII.GetString(ch, 0, 4);
+                    long rem = len - pos - 8;
+                    long size = BE(ch, 4);
+                    if (size > rem)
+                    {
+                        long le = LE(ch, 4);
+                        if (le > rem) throw new InvalidDataException("chunk " + id + " runs past the end of the file");
+                        size = le;
+                    }
+                    if (id == "FILE")
+                    {
+                        if (size > 512L * 1024 * 1024) throw new InvalidDataException("FILE chunk implausibly large");
+                        byte[] t = new byte[size];
+                        if (ReadFull(fs, t, (int)size) != size) throw new InvalidDataException("FILE chunk truncated");
+                        return ParseTree(t);
+                    }
+                    pos += 8 + size;
+                }
+                throw new InvalidDataException("no FILE chunk found");
+            }
+        }
+
+        public static List<string> ParseTree(byte[] t)
+        {
+            foreach (int fsz in FileBlockSizes)
+            {
+                // a) one root directory holding everything
+                List<string> a = new List<string>();
+                int p = 0;
+                if (t.Length > 0 && t[0] == 0 && Entry(t, ref p, fsz, "", a, 0) && p == t.Length && a.Count > 0) return a;
+                // b) a flat run of top-level entries
+                List<string> b = new List<string>();
+                p = 0;
+                bool ok = true;
+                while (p < t.Length) { if (!Entry(t, ref p, fsz, "", b, 1)) { ok = false; break; } }
+                if (ok && p == t.Length && b.Count > 0) return b;
+            }
+            throw new InvalidDataException("unrecognised FILE table layout");
+        }
+
+        static bool Entry(byte[] t, ref int p, int fsz, string prefix, List<string> outp, int depth)
+        {
+            if (depth > 64 || p + 2 > t.Length) return false;
+            byte type = t[p];
+            int nl = t[p + 1];
+            p += 2;
+            if (type > 1 || p + nl > t.Length) return false;
+            for (int k = 0; k < nl; k++) { byte c = t[p + k]; if (c < 0x20 || c == (byte)'/' || c == (byte)'\\') return false; }
+            string name = Encoding.UTF8.GetString(t, p, nl);
+            p += nl;
+            if (type == 0)
+            {
+                if (nl == 0 && depth > 0) return false;           // only the root may be unnamed
+                if (p + 4 > t.Length) return false;
+                uint n = LE(t, p);
+                p += 4;
+                if (n > (uint)(t.Length - p) / 2) return false;
+                string pre = depth == 0 ? "" : prefix + name + "/";  // the root's own name is not part of the path
+                for (uint i = 0; i < n; i++) if (!Entry(t, ref p, fsz, pre, outp, depth + 1)) return false;
+                return true;
+            }
+            if (nl == 0 || p + fsz > t.Length) return false;
+            p += fsz;
+            outp.Add(prefix + name);
+            return true;
+        }
+    }
+
     public sealed class LayerScanInfo
     {
         public List<string> BareCoords = new List<string>();
@@ -1843,19 +1965,51 @@ function Confirm-PrefabGuard {
 # the layers reference that aren't in any addon folder Foreman can see, grouped by the
 # folder they'd live in (ModularStructurePieces, Agricultural, ...), so a stale or missing
 # props pack is named BEFORE anyone opens Workbench. Base-game paths (Prefabs/, Assets/...)
-# can't be checked from disk and are skipped. Warning only - Workshop installs live outside
-# the folders scanned here, and a false alarm must never block a builder.
+# can't be checked from disk and are skipped. Warning only - a false alarm must never block
+# a builder. Workshop installs are packed (.pak): v0.27.5 reads their file tables
+# (Bushwar.PakIndex), and a pack it can't read turns the result into [INFO], not [WARN].
+
+function Get-AddonBases {
+    # Every addons folder we know about: Workbench's, the game client's (where Workshop
+    # downloads land), plus any extraAddonFolders from the config.
+    $bases = @((Get-AddonsRoot), (Join-Path (Get-DocumentsDir) 'My Games\ArmaReforger\addons'))
+    foreach ($x in @((Get-PrefabGuardCfg).extraAddonFolders)) {
+        if ($x) { $bases += [Environment]::ExpandEnvironmentVariables([string]$x) }
+    }
+    return @($bases | Select-Object -Unique)
+}
+
+function Get-PackedAddonFiles {
+    # v0.27.5: Workshop addons are packed (.pak), so their prefabs aren't loose files a
+    # Test-Path can see. Read each pak's file table instead.
+    # Returns @{ Known = case-insensitive set of addon-relative paths; Read = paks read;
+    #            Failed = @("Addon\data.pak: why") }.
+    param([string[]]$Bases)
+    Initialize-LayerScan
+    $known = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $read = 0; $failed = @()
+    foreach ($b in $Bases) {
+        if (-not (Test-Path -LiteralPath $b)) { continue }
+        foreach ($p in @(Get-ChildItem -LiteralPath $b -Filter '*.pak' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue)) {
+            try {
+                foreach ($f in [Bushwar.PakIndex]::Files($p.FullName)) { [void]$known.Add($f) }
+                $read++
+            } catch {
+                $e = $_.Exception
+                if ($e.InnerException) { $e = $e.InnerException }
+                $failed += "$(Split-Path (Split-Path $p.FullName -Parent) -Leaf)\$($p.Name): $($e.Message)"
+            }
+        }
+    }
+    return @{ Known = $known; Read = $read; Failed = $failed }
+}
 
 function Get-AddonContentRoots {
     # Content roots = folders holding a *.gproj, under every addons folder we know about,
     # plus the map's own map/ folder. (Some packs name their project file addon.gproj,
     # most name it after themselves - so match any *.gproj.)
     $roots = New-Object System.Collections.Generic.List[string]
-    $bases = @((Get-AddonsRoot), (Join-Path (Get-DocumentsDir) 'My Games\ArmaReforger\addons'))
-    foreach ($x in @((Get-PrefabGuardCfg).extraAddonFolders)) {
-        if ($x) { $bases += [Environment]::ExpandEnvironmentVariables([string]$x) }
-    }
-    foreach ($b in $bases) {
+    foreach ($b in (Get-AddonBases)) {
         if (-not (Test-Path -LiteralPath $b)) { continue }
         $dirs = @(Get-Item -LiteralPath $b) + @(Get-ChildItem -LiteralPath $b -Directory -Recurse -Depth 2 -ErrorAction SilentlyContinue)
         foreach ($d in $dirs) {
@@ -1883,7 +2037,8 @@ function Get-LayerRefMap {
 function Find-MissingPrefabs {
     # Pure (no repo access) so it can be smoke-tested. Returns one entry per top folder
     # whose referenced files aren't under ANY of the roots, biggest first.
-    param($LayerRefs, [string[]]$Roots, [string[]]$BaseRoots)
+    # $Known (optional): paths already found inside packed Workshop addons.
+    param($LayerRefs, [string[]]$Roots, [string[]]$BaseRoots, $Known = $null)
     $need = @{}
     foreach ($ln in $LayerRefs.Keys) {
         foreach ($e in $LayerRefs[$ln]) {
@@ -1896,8 +2051,8 @@ function Find-MissingPrefabs {
     }
     $by = @{}
     foreach ($path in $need.Keys) {
-        $hit = $false
-        foreach ($r in $Roots) { if (Test-Path -LiteralPath (Join-Path $r $path)) { $hit = $true; break } }
+        $hit = ($null -ne $Known -and $Known.Contains($path))
+        if (-not $hit) { foreach ($r in $Roots) { if (Test-Path -LiteralPath (Join-Path $r $path)) { $hit = $true; break } } }
         if ($hit) { continue }
         $seg = $path.Split('/')[0]
         if (-not $by.ContainsKey($seg)) { $by[$seg] = @{ Root = $seg; Total = 0; Layers = @{}; Example = $path } }
@@ -1913,19 +2068,42 @@ function Get-DependencyWarnings {
     if ($refs.Count -eq 0) { return @{ Lines = @('[INFO] dependency check skipped - no layers found'); Summary = ''; Missing = 0 } }
     $roots = @(Get-AddonContentRoots)
     $pcfg = Get-PrefabGuardCfg
-    $missing = @(Find-MissingPrefabs -LayerRefs $refs -Roots $roots -BaseRoots (@($pcfg.baseGameRoots) + @($pcfg.ignoreRoots)))
-    if ($missing.Count -eq 0) {
-        return @{ Lines = @("[OK]   every addon prefab the layers use was found ($($roots.Count) addon folder(s) checked)"); Summary = ''; Missing = 0 }
+    $baseRoots = @($pcfg.baseGameRoots) + @($pcfg.ignoreRoots)
+    $missing = @(Find-MissingPrefabs -LayerRefs $refs -Roots $roots -BaseRoots $baseRoots)
+    # v0.27.5: loose files leave gaps -> look inside packed Workshop addons too (only now,
+    # so a PC with everything unpacked never pays for reading paks).
+    $packs = @{ Read = 0; Failed = @() }
+    if ($missing.Count -gt 0) {
+        $packs = Get-PackedAddonFiles -Bases (Get-AddonBases)
+        if ($packs.Read -gt 0) { $missing = @(Find-MissingPrefabs -LayerRefs $refs -Roots $roots -BaseRoots $baseRoots -Known $packs.Known) }
     }
-    $lines = @(); $total = 0
+    $checked = "$($roots.Count) addon folder(s)"
+    if ($packs.Read -gt 0) { $checked += " and $($packs.Read) packed Workshop addon(s)" }
+    if ($missing.Count -eq 0) {
+        return @{ Lines = @("[OK]   every addon prefab the layers use was found ($checked checked)"); Summary = ''; Missing = 0 }
+    }
+    $total = 0
+    foreach ($m in $missing) { $total += $m.Total }
+    $folders = (@($missing | ForEach-Object { $_.Root }) | Select-Object -First 6) -join ', '
+    $failed = @($packs.Failed)
+    if ($failed.Count -gt 0) {
+        # Some packs couldn't be read, so "not found" proves nothing: say so quietly, no
+        # [WARN]/[ATTN]. The ship-time PREFAB GUARD still catches a real strip.
+        $lines = @("[INFO] $total prefab path(s) the layers use (under $folders) couldn't be checked: Foreman couldn't read $($failed.Count) packed Workshop addon(s) on this PC. If those objects show up in Workbench you're fine - the ship-time PREFAB GUARD still protects the team. Post this line in chat so Foreman can be taught this pack format.")
+        foreach ($f in @($failed | Select-Object -First 3)) { $lines += "[INFO]   couldn't read $f" }
+        return @{ Lines = $lines; Summary = ''; Missing = $total }
+    }
+    $lines = @()
     foreach ($m in $missing) {
-        $total += $m.Total
         $who = (@($m.Layers.Keys | Sort-Object) | Select-Object -First 4) -join ', '
         $lines += "[WARN] $($m.Total) prefab(s) under '$($m.Root)/' were NOT found in any addon folder (e.g. $($m.Example)); used by: $who. An addon is missing or OUT OF DATE - if Workbench opens with this, it will STRIP them from those layers on save. Update/install the addon that provides '$($m.Root)/' (the Fireforce props pack, most likely), then run Doctor again."
     }
-    $lines += '[INFO] (If you installed the packs through the Steam Workshop rather than copying them into the Workbench addons folder, this may be a false alarm - the ship-time PREFAB GUARD is what actually protects the team.)'
-    $folders = (@($missing | ForEach-Object { $_.Root }) | Select-Object -First 6) -join ', '
-    $summary = "[WARN] $total prefab path(s) the layers use were NOT found in any addon folder here (folders: $folders). An addon is missing or out of date - Workbench would STRIP these from the layers on save. Update/install the props addons, then hit Doctor for the full list. (Workshop installs can false-alarm - the ship-time PREFAB GUARD is the real protection.)"
+    if ($packs.Read -gt 0) {
+        $lines += "[INFO] ($checked were checked, Workshop packs included, so these really are missing here: update the props packs in the Workshop, or install the one that's absent.)"
+    } else {
+        $lines += "[INFO] (No packed Workshop addons were found in the usual folders either. If your Workshop addons live somewhere else, add that folder to extraAddonFolders. The ship-time PREFAB GUARD is what actually protects the team.)"
+    }
+    $summary = "[WARN] $total prefab path(s) the layers use were NOT found in any addon folder here (folders: $folders). An addon is missing or out of date - Workbench would STRIP these from the layers on save. Update/install the props addons, then hit Doctor for the full list."
     return @{ Lines = $lines; Summary = $summary; Missing = $total }
 }
 
@@ -3284,6 +3462,52 @@ if ($SmokeTest) {
     Write-Host "SMOKE: dependency finder -> missing-folders=$($miss.Count) root=$(if ($miss.Count) { $miss[0].Root }) count=$(if ($miss.Count) { $miss[0].Total }) ok=$missOk (expect 1 / Gone / 2 / True)"
     if (-not $missOk) {
         Write-Host 'SMOKE: DEPENDENCY FINDER FAILED'
+        exit 1
+    }
+    # packed Workshop addon (v0.27.5): a synthetic PAC1 pak (odd-sized DATA chunk + pad byte,
+    # nested dirs) is read back to addon-relative paths that resolve the finder; a junk .pak
+    # lands in Failed instead of throwing.
+    $pakBase = Join-Path $env:TEMP "foreman-pak-$PID"
+    $okPak = $false; $pakDetail = ''
+    try {
+        $ms = New-Object System.IO.MemoryStream
+        $bw = New-Object System.IO.BinaryWriter($ms)
+        $be = { param([uint32]$v) [byte[]]@((($v -shr 24) -band 255), (($v -shr 16) -band 255), (($v -shr 8) -band 255), ($v -band 255)) }
+        $ascii = [System.Text.Encoding]::ASCII
+        $ft = New-Object System.IO.MemoryStream
+        $fw = New-Object System.IO.BinaryWriter($ft)
+        $dirE = { param($w, [string]$n, [uint32]$c) $w.Write([byte]0); $w.Write([byte]$n.Length); $w.Write($ascii.GetBytes($n)); $w.Write($c) }
+        $fileE = { param($w, [string]$n) $w.Write([byte]1); $w.Write([byte]$n.Length); $w.Write($ascii.GetBytes($n)); $w.Write((New-Object byte[] 24)) }
+        & $dirE $fw '' 1
+        & $dirE $fw 'Packed' 2
+        & $fileE $fw 'a.et'
+        & $dirE $fw 'Prefabs' 1
+        & $fileE $fw 'wall.et'
+        $fw.Flush(); $fileTable = $ft.ToArray()
+        $bw.Write($ascii.GetBytes('FORM')); $bw.Write([byte[]](& $be 0)); $bw.Write($ascii.GetBytes('PAC1'))
+        $bw.Write($ascii.GetBytes('HEAD')); $bw.Write([byte[]](& $be 28)); $bw.Write((New-Object byte[] 28))
+        $bw.Write($ascii.GetBytes('DATA')); $bw.Write([byte[]](& $be 5)); $bw.Write((New-Object byte[] 5)); $bw.Write([byte]0)
+        $bw.Write($ascii.GetBytes('FILE')); $bw.Write([byte[]](& $be $fileTable.Length)); $bw.Write($fileTable)
+        $bw.Flush(); $pak = $ms.ToArray()
+        $sz = & $be ($pak.Length - 8); for ($k = 0; $k -lt 4; $k++) { $pak[4 + $k] = $sz[$k] }
+        New-Item -ItemType Directory -Path (Join-Path $pakBase 'GoodPack_ABC') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $pakBase 'JunkPack_DEF') -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $pakBase 'GoodPack_ABC\data.pak'), $pak)
+        [System.IO.File]::WriteAllBytes((Join-Path $pakBase 'JunkPack_DEF\data.pak'), [byte[]](1..64))
+        $pf = Get-PackedAddonFiles -Bases @($pakBase)
+        $pRefs = @{ 'Joe_Props' = (New-Object 'System.Collections.Generic.HashSet[string]') }
+        [void]$pRefs['Joe_Props'].Add('EEEEEEEEEEEEEEEE|Packed/Prefabs/wall.et')
+        [void]$pRefs['Joe_Props'].Add('FFFFFFFFFFFFFFFF|packed/a.et')
+        [void]$pRefs['Joe_Props'].Add('1111111111111111|Packed/Prefabs/gone.et')
+        $pMiss = @(Find-MissingPrefabs -LayerRefs $pRefs -Roots @() -BaseRoots @('Prefabs') -Known $pf.Known)
+        $okPak = ($pf.Read -eq 1 -and @($pf.Failed).Count -eq 1 -and $pf.Known.Count -eq 2 -and
+                  $pMiss.Count -eq 1 -and $pMiss[0].Total -eq 1 -and $pMiss[0].Example -eq 'Packed/Prefabs/gone.et')
+        $pakDetail = "read=$($pf.Read) failed=$(@($pf.Failed).Count) files=$($pf.Known.Count) unresolved=$(if ($pMiss.Count) { $pMiss[0].Total })"
+    } catch { $pakDetail = "threw: $($_.Exception.Message)" }
+    finally { Remove-Item $pakBase -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host "SMOKE: packed Workshop addon -> $pakDetail ok=$okPak (expect read=1 failed=1 files=2 unresolved=1 ok=True)"
+    if (-not $okPak) {
+        Write-Host 'SMOKE: PACKED ADDON READER FAILED'
         exit 1
     }
     # end-to-end on a THROWAWAY git repo (folder name has a space, like builders' paths often do):
