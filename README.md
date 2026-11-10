@@ -26,7 +26,7 @@ mark (`assets\bw-mark.png`).
 | **⬆ SHIP SESSION** | Scans your work and shows the plan: which sculpted tiles ship, which **save-churn tiles get auto-discarded** (Workbench rewrites all ~1,155 tiles on save — shipping that collides with everyone), and that the shared index (`resourceDatabase.rdb`) is kept out (it can't merge; Workbench regenerates it). On **Confirm**, before anything is filtered, it **backs up your whole session**: a local git ref *and* a hidden backup on GitHub (see *Getting work back*); no backup, no ship. Then the **STICK GATE**: if you changed a base layer while someone else holds the layer stick, the ship waits (nothing dropped) until they hand it back. **Every real layer edit ships**, whatever name is on the layer — layers have no owners; the only layer change left out is a Workbench re-save whose content is **identical** to master's (compared entity by entity to 1 mm, never by count). The **PREFAB GUARD** checks **every** layer you changed for objects that lost their prefab link (what Workbench does when an addon the map depends on, usually the Fireforce props pack, is missing or out of date on your machine: the objects turn into invisible empty entities and the next ship wipes them for the whole team). A prefab-less object that carries its own mesh (a raw `.xob` placed as a GenericEntity, like modular walls or windows) is deliberate work, not an empty entity, and never trips it (v0.26.2). It offers **REPAIR** (re-attach the links from the copy on `master`, keep the rest of your session) or **DISCARD** (back to master's copy), and there is **no ship-anyway**. Type a one-liner, **Confirm** → commit, **push straight to `master`** — no review step, no PR. If a teammate shipped seconds earlier, their work is slotted underneath yours automatically; a genuine same-file conflict stops dead for a human, with your work committed on your machine. |
 | **✋ TAP IN / TAP OUT** | The **LAYER STICK**: one person in the base layers at a time (`default`, `Forests`, `Vegetation`, `Water` and the road layers `Roads1/2`, `Dirt1/2`, `Footpaths1/2`). They are one unmergeable file each, so two people's edits to one can't be combined and somebody redoes their work by hand. TAP IN puts your name in `collaboration/LAYER-STICK.md` on `master`. **While you hold it, nobody else's base-layer edits can ship** (theirs wait on their PC; nothing is dropped), and anyone who changes a base layer anyway gets a warning within ~30 s of saving. **Shipping hands the stick back automatically.** Stick free when you ship? Your base-layer edits just ship. Tapping out never drops anything. If a teammate holds it, the button says who. Tapping in refuses on a stale copy. |
 | **⟳ Refresh** | Re-reads your repo state, the ship plan, and the team panel. |
-| **✚ Doctor** | Checks git, the repo, GitHub reachability, your git identity, the **Workbench junction** (the "Tools reads a stale copy" trap), **Workbench's last start** (if a recent Workbench log shows "Can't initialize engine" / the base game not found, START SESSION opens the project list instead and says to verify Tools in Steam; a clean or missing log means a normal direct launch), and **the dependency prefabs**: it reads every prefab path the world layers use, including inside packed Workshop addons (`data.pak`), and names any folder (`ModularStructurePieces/`, `Agricultural/`, …) it can't find on your machine, i.e. a missing or out-of-date props pack, *before* Workbench can strip anything. START SESSION runs the same check after pulling. |
+| **✚ Doctor** | Checks git, the repo, GitHub reachability, your git identity, the **Workbench junction** (the "Tools reads a stale copy" trap), **Workbench's last start** (if a recent Workbench log shows "Can't initialize engine" / the base game not found, START SESSION opens the project list instead and says to verify Tools in Steam; a clean or missing log means a normal direct launch), and **the dependency prefabs**: it reads every prefab path the world layers use, including inside packed Workshop addons (`data.pak`), and names any folder (`ModularStructurePieces/`, `Agricultural/`, …) it can't find on your machine, i.e. a missing or out-of-date props pack, *before* Workbench can strip anything. START SESSION runs the same check after pulling. Each Doctor press also sends the report and the builder's recent Workbench logs to the team (see *Troubleshooting a builder's PC*). |
 
 ## Getting work back
 
@@ -102,6 +102,26 @@ Rules of the road live in the map repo:
 Everything project-specific lives in **`foreman.config.json`** — repo URL, default
 branch, the terrain tile pattern, the never-commit list, the WORLD-LOCK path. Point it
 at a different Reforger team repo and Foreman runs that project's ritual instead.
+
+## Troubleshooting a builder's PC (diagnostics, v0.28)
+
+Every **Doctor** press sends the builder's Doctor report, their last 3 Workbench log
+folders (`Documents\My Games\ArmaReforgerWorkbench\logs`, big logs trimmed to the first
+3 MB + last 1 MB) and a list of every addon folder Workbench and Foreman can see to the
+private map repo on GitHub, as `refs/diag/<git name>/<stamp>`. Like the backups these
+are not branches and never come down in a normal fetch; the newest 10 per person are
+kept. The builder does nothing beyond pressing Doctor. One PC can opt out with
+`"sendDiagnostics": false` in its `local.json`.
+
+To read them:
+
+```powershell
+powershell -File tools\get-diagnostics.ps1 -Repo C:\path\to\fireforce            # newest per person
+powershell -File tools\get-diagnostics.ps1 -Repo C:\path\to\fireforce -Who emu   # one person
+```
+
+Each report lands in `.\diagnostics\<name>\<stamp>\` as `doctor.txt`, `addons.txt` and
+`workbench-logs\`.
 
 ## Dev notes
 

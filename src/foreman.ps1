@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.9'
+$script:ForemanVersion = '0.28.0'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -1220,6 +1220,154 @@ function Remove-OldBackups {
     $del = @($refs[$Keep..($refs.Count - 1)] | ForEach-Object { ":$_" })
     Run-Git $script:MapRepo (@('push', '--quiet', '--no-verify', 'origin') + $del) | Out-Null
     return $del.Count
+}
+
+# ------------------------------------------------------- diagnostics (v0.28)
+# chazman69, 2026-11-10: "we want to see these logs from users so we can troubleshoot" -
+# without asking builders to run PowerShell. Every Doctor press sends the Doctor report,
+# the last few Workbench log folders and the addon folder list to GitHub as
+# refs/diag/<git name>/<stamp> (a commit with no parent, like the backups: not a branch,
+# never in a normal fetch). The repo is private. Keep the newest diagnostics.keepPerPerson.
+# Opt out on one PC: "sendDiagnostics": false in local.json.
+# Maintainer: git fetch origin "refs/diag/*:refs/diag/*", then
+#   git log --all --format="%H %s" refs/diag   and   git show <sha>:doctor.txt
+function Get-DiagCfg {
+    $c = @{ Prefix = 'refs/diag'; Keep = 10; Sessions = 3 }
+    if ($script:Cfg -and $script:Cfg.PSObject.Properties['diagnostics']) {
+        $d = $script:Cfg.diagnostics
+        if ($d.PSObject.Properties['remoteRefPrefix'] -and $d.remoteRefPrefix) { $c.Prefix = ([string]$d.remoteRefPrefix).TrimEnd('/') }
+        if ($d.PSObject.Properties['keepPerPerson'] -and [int]$d.keepPerPerson -gt 0) { $c.Keep = [int]$d.keepPerPerson }
+        if ($d.PSObject.Properties['workbenchSessions'] -and [int]$d.workbenchSessions -gt 0) { $c.Sessions = [int]$d.workbenchSessions }
+    }
+    return $c
+}
+
+function Get-WorkbenchLogsDir {
+    return (Join-Path (Get-DocumentsDir) 'My Games\ArmaReforgerWorkbench\logs')
+}
+
+function Read-LogForDiag {
+    # A log's bytes for the bundle: whole when small, else the first $Head and last $Tail
+    # bytes with a marker between (engine start-up is at the top, the crash at the bottom).
+    param([string]$Path, [int]$Head = 3MB, [int]$Tail = 1MB)
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $len = $fs.Length
+        if ($len -le ($Head + $Tail)) {
+            $all = New-Object byte[] $len
+            [void]$fs.Read($all, 0, [int]$len)
+            return , $all
+        }
+        $h = New-Object byte[] $Head
+        [void]$fs.Read($h, 0, $Head)
+        $fs.Position = $len - $Tail
+        $t = New-Object byte[] $Tail
+        [void]$fs.Read($t, 0, $Tail)
+        $mark = [System.Text.Encoding]::ASCII.GetBytes("`r`n`r`n----- [Foreman: $($len - $Head - $Tail) bytes cut from the middle of this log] -----`r`n`r`n")
+        $out = New-Object byte[] ($Head + $mark.Length + $Tail)
+        [Array]::Copy($h, 0, $out, 0, $Head)
+        [Array]::Copy($mark, 0, $out, $Head, $mark.Length)
+        [Array]::Copy($t, 0, $out, $Head + $mark.Length, $Tail)
+        return , $out
+    } finally { $fs.Dispose() }
+}
+
+function Get-AddonFolderReport {
+    # One line per addon folder in every folder we know about: what Workbench (and Foreman) can see.
+    $lines = @()
+    $bases = @(Get-AddonBases)
+    try { $wb = Find-WorkbenchExe; if ($wb) { $bases += (Join-Path (Split-Path -Parent $wb) 'addons'); $lines += "Workbench exe: $wb" } } catch { }
+    foreach ($b in $bases) {
+        $lines += ''
+        $lines += "== $b"
+        if (-not (Test-Path -LiteralPath $b)) { $lines += '   (folder does not exist)'; continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $b -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $kind = @()
+            if (@(Get-ChildItem -LiteralPath $d.FullName -Filter '*.gproj' -File -ErrorAction SilentlyContinue).Count) { $kind += 'gproj' }
+            if (@(Get-ChildItem -LiteralPath $d.FullName -Filter '*.pak' -File -ErrorAction SilentlyContinue).Count) { $kind += 'pak' }
+            if ($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $kind += 'junction' }
+            $lines += "   $($d.Name)  [$($kind -join ',')]"
+        }
+    }
+    return $lines
+}
+
+function New-DiagnosticsCommit {
+    # Builds the bundle as a parentless commit in the map repo (temp index, nothing in the
+    # working tree or real index changes). Returns @{ Sha; Files; Logs }.
+    param([string[]]$DoctorLines, [string]$LogsDir = (Get-WorkbenchLogsDir), [int]$Sessions = 0)
+    if ($Sessions -le 0) { $Sessions = (Get-DiagCfg).Sessions }
+    $repo = $script:MapRepo
+    $tag = "$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $tmp = Join-Path $env:TEMP "foreman-diag-$tag"
+    $idx = Join-Path $env:TEMP "foreman-diag-$tag.idx"
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $prevIdx = $env:GIT_INDEX_FILE
+    try {
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $os = ''
+        try { $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop | ForEach-Object { "$($_.Caption) $($_.Version)" }) } catch { $os = [Environment]::OSVersion.VersionString }
+        $hdr = @("Foreman v$script:ForemanVersion", "When: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))", "Who: $(Get-BackupOwner)",
+                 "Windows: $os", "PowerShell: $($PSVersionTable.PSVersion)", "Map repo: $repo", "Documents: $(Get-DocumentsDir)", '')
+        [System.IO.File]::WriteAllLines((Join-Path $tmp 'doctor.txt'), [string[]]($hdr + @($DoctorLines)), $utf8)
+        $addons = @()
+        try { $addons = @(Get-AddonFolderReport) } catch { $addons = @("addon report failed: $($_.Exception.Message)") }
+        [System.IO.File]::WriteAllLines((Join-Path $tmp 'addons.txt'), [string[]]$addons, $utf8)
+        $logs = 0
+        if (Test-Path -LiteralPath $LogsDir) {
+            $sessionsDirs = @(Get-ChildItem -LiteralPath $LogsDir -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $Sessions)
+            $pick = @()
+            foreach ($s in $sessionsDirs) { $pick += @(Get-ChildItem -LiteralPath $s.FullName -Filter '*.log' -File -ErrorAction SilentlyContinue | ForEach-Object { @{ F = $_; Rel = "$($s.Name)\$($_.Name)" } }) }
+            $pick += @(Get-ChildItem -LiteralPath $LogsDir -Filter '*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $Sessions | ForEach-Object { @{ F = $_; Rel = $_.Name } })
+            foreach ($p in $pick) {
+                try {
+                    $dest = Join-Path (Join-Path $tmp 'workbench-logs') $p.Rel
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+                    [System.IO.File]::WriteAllBytes($dest, (Read-LogForDiag $p.F.FullName))
+                    $logs++
+                } catch { }
+            }
+        }
+        if ($logs -eq 0) { [System.IO.File]::WriteAllText((Join-Path $tmp 'workbench-logs-NONE.txt'), "No Workbench logs found in $LogsDir`r`n", $utf8) }
+        $env:GIT_INDEX_FILE = $idx
+        $r = Run-Git $repo @("--work-tree=$tmp", '-c', 'core.autocrlf=false', 'add', '-A', '-f', '--', ':/')
+        if ($r.Code -ne 0) { throw "add: $($r.Out)" }
+        $tree = (Run-Git $repo @('write-tree')).Out
+        if (-not $tree) { throw 'write-tree returned nothing' }
+        $files = @((Run-Git $repo @('ls-files')).Out -split "`r?`n" | Where-Object { $_ }).Count
+    } finally {
+        if ($prevIdx) { $env:GIT_INDEX_FILE = $prevIdx } else { Remove-Item Env:\GIT_INDEX_FILE -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $idx, "$idx.lock" -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $c = Run-Git $repo @('-c', 'user.name=BUSHWAR Foreman', '-c', 'user.email=foreman@localhost',
+        'commit-tree', $tree, '-m', "Foreman diagnostics: $(Get-BackupOwner), Foreman v$script:ForemanVersion, $logs Workbench log(s)")
+    if ($c.Code -ne 0 -or -not $c.Out) { throw "commit-tree: $($c.Out)" }
+    return @{ Sha = $c.Out.Trim(); Files = $files; Logs = $logs }
+}
+
+function Send-Diagnostics {
+    # Doctor report + Workbench logs -> GitHub. One plain-words line back; never throws.
+    param([string[]]$DoctorLines)
+    if ($script:Local -and $script:Local.sendDiagnostics -eq $false) {
+        return '[INFO] Diagnostics not sent (turned off on this PC in local.json).'
+    }
+    try {
+        $cfg = Get-DiagCfg
+        $b = New-DiagnosticsCommit -DoctorLines $DoctorLines
+        $ref = "$($cfg.Prefix)/$(Get-BackupOwner)/$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        $r = Run-Git $script:MapRepo @('push', '--quiet', '--no-verify', 'origin', "$($b.Sha):$ref")
+        if ($r.Code -ne 0) { return "[INFO] Couldn't send diagnostics to the team (internet? sign-in?) - screenshot this box instead. ($($r.Out))" }
+        try {
+            $mine = "$($cfg.Prefix)/$(Get-BackupOwner)/"
+            $ls = Run-Git $script:MapRepo @('ls-remote', 'origin', "$mine*")
+            $refs = @($ls.Out -split "`r?`n" | ForEach-Object { ($_ -split "`t")[-1] } | Where-Object { $_ -like "$mine*" } | Sort-Object -Descending)
+            if ($refs.Count -gt $cfg.Keep) { Run-Git $script:MapRepo (@('push', '--quiet', '--no-verify', 'origin') + @($refs[$cfg.Keep..($refs.Count - 1)] | ForEach-Object { ":$_" })) | Out-Null }
+        } catch { }
+        return "[OK]   Sent this report and your last $($b.Logs) Workbench log file(s) to the team for troubleshooting ($ref). Nothing else to do."
+    } catch {
+        return "[INFO] Couldn't put together the diagnostics: $($_.Exception.Message)"
+    }
 }
 
 function ConvertTo-ProcessArgs([string[]]$items) {
@@ -3379,7 +3527,9 @@ $ui.btnStick.Add_Click({
 function Run-Doctor {
     Invoke-Busy 'Checking your setup (about 20 seconds)...' {
         try {
-            foreach ($line in (Invoke-Doctor -Interactive)) { Log $line }
+            $docLines = @(Invoke-Doctor -Interactive)
+            foreach ($line in $docLines) { Log $line }
+            Log (Send-Diagnostics -DoctorLines $docLines)
             Refresh-Header
         } catch { Set-Problem "Doctor couldn't finish: $($_.Exception.Message)" }
     }
@@ -3657,6 +3807,62 @@ if ($SmokeTest) {
         $pakDetail = "read=$($pf.Read) failed=$(@($pf.Failed).Count) files=$($pf.Known.Count) unresolved=$(if ($pMiss.Count) { $pMiss[0].Total })"
     } catch { $pakDetail = "threw: $($_.Exception.Message)" }
     finally { Remove-Item $pakBase -Recurse -Force -ErrorAction SilentlyContinue }
+    # diagnostics bundle (v0.28): built in a throwaway repo from fake Workbench logs - newest
+    # session only (Sessions=1), a big console.log trimmed head+tail, nothing in the
+    # working tree or real index touched. The push is not exercised here.
+    $dgRepo = Join-Path $env:TEMP "foreman diag it $PID"
+    $dgLogs = Join-Path $dgRepo 'wblogs'
+    $dgOk = $false; $dgDetail = ''
+    $realRepoDg = $script:MapRepo
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $dgLogs 'logs_2026-11-10_12-00-00'), (Join-Path $dgLogs 'logs_2026-11-09_09-00-00') -Force | Out-Null
+        Run-Git $dgRepo @('init', '-q') | Out-Null
+        'tracked' | Out-File (Join-Path $dgRepo 'keep.txt') -Encoding ascii
+        Run-Git $dgRepo @('add', 'keep.txt') | Out-Null
+        Run-Git $dgRepo @('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init') | Out-Null
+        $old = Join-Path $dgLogs 'logs_2026-11-09_09-00-00\console.log'
+        'old session' | Out-File $old -Encoding ascii
+        (Get-Item $old).LastWriteTime = (Get-Date).AddDays(-1); (Get-Item (Split-Path $old)).LastWriteTime = (Get-Date).AddDays(-1)
+        $big = New-Object byte[] (5MB); for ($k = 0; $k -lt $big.Length; $k++) { $big[$k] = 65 }
+        [System.IO.File]::WriteAllBytes((Join-Path $dgLogs 'logs_2026-11-10_12-00-00\console.log'), $big)
+        "Can't initialize engine" | Out-File (Join-Path $dgLogs 'logs_2026-11-10_12-00-00\error.log') -Encoding ascii
+        $script:MapRepo = $dgRepo
+        $bundle = New-DiagnosticsCommit -DoctorLines @('[OK]   smoke line') -LogsDir $dgLogs -Sessions 1
+        $tree = (Run-Git $dgRepo @('ls-tree', '-r', '-l', $bundle.Sha)).Out
+        $sizeLine = @($tree -split "`r?`n" | Where-Object { $_ -match 'logs_2026-11-10_12-00-00/console\.log$' })
+        $bigSize = if ($sizeLine.Count) { [int64](($sizeLine[0] -split '\s+')[3]) } else { -1 }
+        $doc = (Run-Git $dgRepo @('show', "$($bundle.Sha):doctor.txt")).Out
+        $clean = -not (Run-Git $dgRepo @('status', '--porcelain', '--', 'keep.txt')).Out
+        $staged = (Run-Git $dgRepo @('diff', '--cached', '--name-only')).Out
+        # the real send: push to a bare "GitHub", keep-newest pruning, then the maintainer
+        # download script pulls it back out
+        $dgBare = Join-Path $env:TEMP "foreman-diag-bare-$PID.git"
+        Run-Git $env:TEMP @('init', '-q', '--bare', $dgBare) | Out-Null
+        Run-Git $dgRepo @('remote', 'add', 'origin', $dgBare) | Out-Null
+        Run-Git $dgRepo @('config', 'user.name', 'Smoke Tester') | Out-Null
+        $sent = Send-Diagnostics -DoctorLines @('[OK]   sent line')
+        $remoteRefs = @(((Run-Git $dgRepo @('ls-remote', 'origin', 'refs/diag/*')).Out -split "`r?`n") | Where-Object { $_ -match 'refs/diag/Smoke-Tester/' })
+        $dlOut = Join-Path $env:TEMP "foreman-diag-dl-$PID"
+        $tool = Join-Path $script:ForemanRoot 'tools\get-diagnostics.ps1'
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $tool -Repo $dgRepo -Out $dlOut -NoOpen | Out-Null
+        $dlDoc = @(Get-ChildItem -LiteralPath $dlOut -Recurse -Filter 'doctor.txt' -File -ErrorAction SilentlyContinue)
+        $dlOk = ($dlDoc.Count -eq 1 -and (Get-Content -LiteralPath $dlDoc[0].FullName -Raw) -match 'sent line')
+        Remove-Item $dgBare, $dlOut -Recurse -Force -ErrorAction SilentlyContinue
+        $dgOk = ($bundle.Logs -eq 2 -and $tree -match 'addons\.txt' -and $tree -match 'error\.log' -and $tree -notmatch 'logs_2026-11-09' -and
+                 $bigSize -gt 4MB -and $bigSize -lt (4MB + 200) -and $doc -match 'smoke line' -and $doc -match 'Foreman v' -and $clean -and -not $staged -and
+                 $sent -like '`[OK`]*' -and $remoteRefs.Count -eq 1 -and $dlOk)
+        $dgDetail = "logs=$($bundle.Logs) files=$($bundle.Files) big=$bigSize old-left-out=$($tree -notmatch 'logs_2026-11-09') report=$($doc -match 'smoke line') untouched=$($clean -and -not $staged) pushed=$($remoteRefs.Count) downloaded=$dlOk"
+        if (-not ($sent -like '`[OK`]*')) { $dgDetail += " send='$sent'" }
+    } catch { $dgDetail = "threw: $($_.Exception.Message)" }
+    finally {
+        $script:MapRepo = $realRepoDg
+        Remove-Item $dgRepo -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "SMOKE: diagnostics bundle -> $dgDetail ok=$dgOk (expect logs=2 big~4MB old-left-out=True report=True untouched=True pushed=1 downloaded=True)"
+    if (-not $dgOk) {
+        Write-Host 'SMOKE: DIAGNOSTICS BUNDLE FAILED'
+        exit 1
+    }
     Write-Host "SMOKE: packed Workshop addon -> $pakDetail ok=$okPak (expect read=1 failed=1 files=2 unresolved=1 ok=True)"
     if (-not $okPak) {
         Write-Host 'SMOKE: PACKED ADDON READER FAILED'

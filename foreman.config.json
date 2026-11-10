@@ -38,6 +38,11 @@
     "keepPerPerson": 60,
     "autoMinutes": 30
   },
+  "diagnostics": {
+    "remoteRefPrefix": "refs/diag",
+    "keepPerPerson": 10,
+    "workbenchSessions": 3
+  },
   "worldLockFile": "collaboration/WORLD-LOCK.md",
   "prCompareUrl": "https://github.com/chazman69/fireforce/compare/master...{branch}?expand=1",
   "docsUrl": "https://github.com/chazman69/fireforce/tree/master/collaboration",
