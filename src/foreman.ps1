@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.7'
+$script:ForemanVersion = '0.27.8'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -406,6 +406,27 @@ function Test-BaseGameLaunchFailed {
     return $false
 }
 
+function Get-LaunchFailureLines {
+    # Pure so it can be smoke-tested. The lines in a failed Workbench start that say what was
+    # missing, timestamp stripped, so Doctor can quote them. v0.27.8: a missing addon can be a
+    # dependency OF a dependency (e.g. ArmaTerrainCore under one of the packs), which the map's
+    # own addon.gproj never lists - only Workbench's log names it.
+    param([string[]]$LogTexts, [int]$Max = 3)
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($t in $LogTexts) {
+        if (-not $t) { continue }
+        foreach ($ln in ($t -split "`r?`n")) {
+            if ($ln -notmatch '(?i)not\s+found|missing|can''?t\s+(load|find)') { continue }
+            if ($ln -notmatch '(?i)addon|[0-9A-F]{16}') { continue }
+            $s = ($ln -replace '^\s*\d{1,2}:\d{2}:\d{2}(\.\d+)?\s*', '').Trim()
+            if ($s.Length -gt 200) { $s = $s.Substring(0, 200) + '...' }
+            if ($s -and -not $out.Contains($s)) { $out.Add($s) }
+            if ($out.Count -ge $Max) { return @($out.ToArray()) }
+        }
+    }
+    return @($out.ToArray())
+}
+
 function Get-RecentWorkbenchLogTexts([int]$Count = 3) {
     # The start of the newest few Workbench console logs (engine start-up is at the top,
     # and some logs run to hundreds of MB, so only the first 2 MB of each is read).
@@ -429,9 +450,11 @@ function Get-RecentWorkbenchLogTexts([int]$Count = 3) {
 }
 
 function Test-WorkbenchNeedsLauncher {
-    # Open the project list instead of a direct -gproj launch only when a recent Workbench
-    # run actually failed to start the engine. No logs / clean logs = launch directly.
-    try { return (Test-BaseGameLaunchFailed (Get-RecentWorkbenchLogTexts)) } catch { return $false }
+    # Open the project list instead of a direct -gproj launch only when the LAST Workbench
+    # run failed to start the engine. No log / clean log = launch directly. Newest log only
+    # (v0.27.8): once the builder fixes the cause, one good start clears it - with the newest
+    # three, an old failure kept a fixed PC on the project list for up to three more starts.
+    try { return (Test-BaseGameLaunchFailed (Get-RecentWorkbenchLogTexts 1)) } catch { return $false }
 }
 
 function Get-WorkbenchProjectFile {
@@ -2623,7 +2646,8 @@ function Invoke-Doctor([switch]$Interactive) {
     $wbExe = $null
     try { $wbExe = Find-WorkbenchExe } catch { }
     if ($wbExe -and (Test-WorkbenchNeedsLauncher)) {
-        $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. The usual cause is a missing dependency addon (if one is, Doctor names it below); otherwise Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity. Until then START SESSION opens the project list: pick Grand Reef there."
+        $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. The usual cause is a missing addon - the map's own, or one a pack needs (Workbench's log lines below name it; download it from the Workshop). Otherwise Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity. Until then START SESSION opens the project list: pick Grand Reef there."
+        try { foreach ($fl in @(Get-LaunchFailureLines (Get-RecentWorkbenchLogTexts 1))) { $results += "[INFO]   Workbench's log: $fl" } } catch { }
     }
     elseif ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
@@ -3891,6 +3915,15 @@ if ($SmokeTest) {
     Write-Host "SMOKE: base game -> healthy=$lHealthy no-logs=$lNone addon-missing=$lAddon cant-init=$lEngine (expect False/False/True/True)"
     if ($lHealthy -or $lNone -or -not $lAddon -or -not $lEngine) {
         Write-Host 'SMOKE: BASE GAME CHECK FAILED'
+        exit 1
+    }
+    # Doctor quotes what the log says was missing (v0.27.8), timestamp stripped, no healthy lines
+    $flLog = "12:00:01.000 RESOURCES    : Addon: ArmaReforger ($script:BaseGameGuid)`r`n12:00:01.100 ENGINE    (E): Addon 'ArmaTerrainCore' (60B524F7A5AE96A8) not found`r`n12:00:01.200 ENGINE    (F): Can't initialize engine"
+    $fl = @(Get-LaunchFailureLines @($flLog))
+    $flOk = ($fl.Count -eq 1 -and $fl[0] -like "ENGINE*ArmaTerrainCore*60B524F7A5AE96A8*not found")
+    Write-Host "SMOKE: launch failure lines -> $($fl -join ' | ') ok=$flOk (expect the ArmaTerrainCore line only, ok=True)"
+    if (-not $flOk) {
+        Write-Host 'SMOKE: LAUNCH FAILURE LINES FAILED'
         exit 1
     }
     # map dependencies (v0.27.7): a Workshop folder named _<GUID> and a loose addon's own GUID
