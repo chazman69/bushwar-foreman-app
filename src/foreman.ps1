@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.27.6'
+$script:ForemanVersion = '0.27.7'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -463,7 +463,7 @@ function Open-Workbench {
         } catch {
             return @{ State = 'failed'; Line = "[WARN] Workbench didn't open ($($_.Exception.Message)). Open it from Steam yourself and choose Grand Reef." }
         }
-        return @{ State = 'launcher'; Line = "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine', so the project list is opening instead: pick Grand Reef. If that keeps happening: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity." }
+        return @{ State = 'launcher'; Line = "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine', so the project list is opening instead: pick Grand Reef. Usual cause: a missing dependency addon - press Doctor to see which." }
     }
     $gproj = Get-WorkbenchProjectFile
     try {
@@ -895,6 +895,7 @@ function Invoke-StartSession {
         $dep = Get-DependencyWarnings
         if ($dep.Summary) { $notes += $dep.Summary }
     } catch { }
+    try { $notes += @(Get-MissingDependencyLines | Where-Object { $_ -like '`[WARN`]*' }) } catch { }
 
     return @{ Branch = $script:Cfg.defaultBranch; Notes = $notes }
 }
@@ -2039,6 +2040,69 @@ function Get-AddonContentRoots {
     return @($roots.ToArray() | Select-Object -Unique)
 }
 
+function Get-MapDependencyGuids {
+    # The GUIDs in the map's addon.gproj Dependencies block.
+    $gp = Join-Path $script:MapRepo 'map\addon.gproj'
+    if (-not (Test-Path -LiteralPath $gp)) { return @() }
+    $text = [System.IO.File]::ReadAllText($gp)
+    $m = [regex]::Match($text, '(?s)Dependencies\s*\{(.*?)\}')
+    if (-not $m.Success) { return @() }
+    return @([regex]::Matches($m.Groups[1].Value, '"([0-9A-Fa-f]{16})"') | ForEach-Object { $_.Groups[1].Value.ToUpper() } | Select-Object -Unique)
+}
+
+function Get-InstalledAddonGuids {
+    # Every addon GUID on this PC: a loose addon's own GUID line in its .gproj, or a
+    # Workshop download's folder name, which ends in _<GUID> (e.g. RuralGairezi_802322404D3C21FB).
+    param([string[]]$Bases)
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($b in $Bases) {
+        if (-not $b -or -not (Test-Path -LiteralPath $b)) { continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $b -Directory -Recurse -Depth 1 -ErrorAction SilentlyContinue)) {
+            if ($d.Name -match '_([0-9A-Fa-f]{16})$') { [void]$set.Add($Matches[1]) }
+        }
+        foreach ($g in @(Get-ChildItem -LiteralPath $b -Filter '*.gproj' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue)) {
+            try {
+                $m = [regex]::Match([System.IO.File]::ReadAllText($g.FullName), '(?m)^\s*GUID\s+"([0-9A-Fa-f]{16})"')
+                if ($m.Success) { [void]$set.Add($m.Groups[1].Value) }
+            } catch { }
+        }
+    }
+    return ,$set
+}
+
+function Find-MissingDependencies {
+    # Pure so it can be smoke-tested: dependency GUIDs not installed, base game excluded
+    # (it lives inside Tools in a layout that varies - see Test-BaseGameLaunchFailed).
+    param([string[]]$Needed, $Installed)
+    return @($Needed | Where-Object { $_ -and $_ -ne $script:BaseGameGuid -and -not $Installed.Contains($_) })
+}
+
+function Get-DependencyNames {
+    # GUID -> addon name from the map repo's map/ADDON.md table (team-maintained).
+    $names = @{}
+    $md = Join-Path $script:MapRepo 'map\ADDON.md'
+    if (Test-Path -LiteralPath $md) {
+        foreach ($m in [regex]::Matches([System.IO.File]::ReadAllText($md, [System.Text.Encoding]::UTF8), '(?m)^\|\s*`([0-9A-Fa-f]{16})`\s*\|\s*([^|\r\n]+?)\s*\|')) {
+            $names[$m.Groups[1].Value.ToUpper()] = ($m.Groups[2].Value -replace '\s*\*\(.*?\)\*', '').Trim()
+        }
+    }
+    return $names
+}
+
+function Get-MissingDependencyLines {
+    # v0.27.7: name the map dependencies this PC doesn't have. Workbench can't start the
+    # map without them ("Can't initialize engine"), which is what a new builder hits first.
+    $need = @(Get-MapDependencyGuids)
+    if ($need.Count -eq 0) { return @() }
+    $have = Get-InstalledAddonGuids -Bases (Get-AddonBases)
+    $miss = @(Find-MissingDependencies -Needed $need -Installed $have)
+    $n = @($need | Where-Object { $_ -ne $script:BaseGameGuid }).Count
+    if ($miss.Count -eq 0) { return @("[OK]   all $n addons Grand Reef depends on are installed") }
+    $names = Get-DependencyNames
+    $list = (@($miss | ForEach-Object { if ($names[$_]) { "$($names[$_]) ($_)" } else { $_ } })) -join ', '
+    return @("[WARN] Grand Reef depends on $($miss.Count) addon(s) this PC doesn't have: $list. Without them Workbench can't start the map ('Can't initialize engine'). Fix: find each one in the Arma Reforger Workshop (by name, or paste the GUID into the search) and download it, then Doctor again.")
+}
+
 function Get-LayerRefMap {
     # layer name -> set of "GUID|path" references, from the working-tree layers.
     Initialize-LayerScan
@@ -2559,10 +2623,13 @@ function Invoke-Doctor([switch]$Interactive) {
     $wbExe = $null
     try { $wbExe = Find-WorkbenchExe } catch { }
     if ($wbExe -and (Test-WorkbenchNeedsLauncher)) {
-        $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. START SESSION opens the project list instead: pick Grand Reef there. If it keeps happening: Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity."
+        $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. The usual cause is a missing dependency addon (if one is, Doctor names it below); otherwise Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity. Until then START SESSION opens the project list: pick Grand Reef there."
     }
     elseif ($wbExe) { $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)' }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
+    # map dependencies (v0.27.7): is every addon the map's addon.gproj lists installed?
+    try { $results += @(Get-MissingDependencyLines) }
+    catch { $results += "[INFO] addon dependency check couldn't run: $($_.Exception.Message)" }
     # dependency prefabs (v0.25): do the prefabs the layers use actually exist on this machine?
     try { $results += (Get-DependencyWarnings).Lines }
     catch { $results += "[INFO] dependency check couldn't run: $($_.Exception.Message)" }
@@ -3824,6 +3891,26 @@ if ($SmokeTest) {
     Write-Host "SMOKE: base game -> healthy=$lHealthy no-logs=$lNone addon-missing=$lAddon cant-init=$lEngine (expect False/False/True/True)"
     if ($lHealthy -or $lNone -or -not $lAddon -or -not $lEngine) {
         Write-Host 'SMOKE: BASE GAME CHECK FAILED'
+        exit 1
+    }
+    # map dependencies (v0.27.7): a Workshop folder named _<GUID> and a loose addon's own GUID
+    # count as installed; a GUID a loose addon merely DEPENDS on doesn't; the base game is never asked for.
+    $depT = Join-Path $env:TEMP "foreman-deps-$PID"
+    New-Item -ItemType Directory -Path (Join-Path $depT 'BushwarPack2_657A1A9334708DE4'), (Join-Path $depT 'Pack3') -Force | Out-Null
+    "GameProject {`r`n GUID `"66334D841E7BD416`"`r`n Dependencies {`r`n  `"652412D10AC38900`"`r`n }`r`n}" | Out-File (Join-Path $depT 'Pack3\Pack3.gproj') -Encoding utf8
+    $haveT = Get-InstalledAddonGuids -Bases @($depT, (Join-Path $depT 'nope'))
+    $missT = @(Find-MissingDependencies -Needed @($script:BaseGameGuid, '657A1A9334708DE4', '66334D841E7BD416', '652412D10AC38900') -Installed $haveT)
+    Remove-Item $depT -Recurse -Force -ErrorAction SilentlyContinue
+    $depOk = ($missT.Count -eq 1 -and $missT[0] -eq '652412D10AC38900')
+    Write-Host "SMOKE: map dependencies -> installed=$($haveT.Count) missing=$($missT -join ',') ok=$depOk (expect installed=2 missing=652412D10AC38900 ok=True)"
+    if (-not $depOk) {
+        Write-Host 'SMOKE: MAP DEPENDENCY CHECK FAILED'
+        exit 1
+    }
+    try {
+        foreach ($dl in @(Get-MissingDependencyLines)) { Write-Host ('SMOKE: map dependencies (this PC, informational) -> ' + $dl.Substring(0, [Math]::Min(300, $dl.Length))) }
+    } catch {
+        Write-Host "SMOKE: MAP DEPENDENCY CHECK THREW: $($_.Exception.Message)"
         exit 1
     }
     Write-Host "SMOKE: dupe test -> map-copy=$dupMap dependency=$dupDep no-gproj=$dupNone (expect True/False/False)"
