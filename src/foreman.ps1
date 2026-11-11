@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.28.2'
+$script:ForemanVersion = '0.28.3'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -849,6 +849,20 @@ function Invoke-SelfUpdate {
 
 # ----------------------------------------------------- session + ship logic
 
+function Get-LeftoverLandedBy([string]$repo, [string]$branch) {
+    # Returns the short sha of the master commit(s) that say "Lands-for: <sha>" for EVERY
+    # commit in origin/<branch>..HEAD, or $null if any leftover is not covered.
+    $shas = @(((Run-Git $repo @('rev-list', "origin/$branch..HEAD")).Out -split "`r?`n") | Where-Object { $_ -match '^[0-9a-f]{40}$' })
+    if ($shas.Count -eq 0) { return $null }
+    $by = @()
+    foreach ($s in $shas) {
+        $hit = (Run-Git $repo @('log', "origin/$branch", '-n', '1', '--format=%h', '--fixed-strings', "--grep=Lands-for: $s")).Out
+        if (-not $hit -or -not $hit.Trim()) { return $null }
+        $by += $hit.Trim()
+    }
+    return (($by | Select-Object -Unique) -join ', ')
+}
+
 function Test-RebaseInProgress([string]$repo) {
     $gd = (Run-Git $repo @('rev-parse', '--git-dir')).Out
     if (-not $gd) { return $false }
@@ -1024,6 +1038,20 @@ function Invoke-StartSession {
             throw "Couldn't back up your leftover commit(s) to GitHub, so nothing was pulled or pushed - your work is safe on this PC. ($($_.Exception.Message))"
         }
         if ($bk) { $notes += "[OK] Backed up your leftover work to GitHub: $($bk.Remote)" }
+        # v0.28.3: a teammate may already have landed this work for you (e.g. after a layer
+        # clash someone combined it by hand) - master then carries a "Lands-for: <sha>" line
+        # for every leftover commit. Sync to master instead of re-landing (which would clash
+        # again forever). Only when EVERY leftover is covered; reset --keep refuses rather
+        # than overwrite anything uncommitted.
+        $landedBy = Get-LeftoverLandedBy $repo $script:Cfg.defaultBranch
+        if ($landedBy) {
+            $r = Run-Git $repo @('reset', '--keep', "origin/$($script:Cfg.defaultBranch)")
+            if ($r.Code -ne 0) { throw "Your leftover work is already on the team map, but Foreman couldn't sync to it. Nothing was lost (backed up). Post in the group chat. ($($r.Out))" }
+            $notes += "[FIX] your leftover commit(s) from last time ($($subjects -join '; ')) were already landed on the team map by a teammate ($landedBy) - synced to it, nothing lost."
+            $ahead = 0
+        }
+    }
+    if ($ahead -gt 0) {
         # stick GATE: leftover base-layer edits wait while someone else holds the stick
         $leftBase = @(Get-BaseLayerPaths @(((Run-Git $repo @('diff', '--name-only', "origin/$($script:Cfg.defaultBranch)...HEAD")).Out -split "`r?`n")))
         if ($leftBase.Count -gt 0) {
@@ -1043,7 +1071,7 @@ function Invoke-StartSession {
             $res = Resolve-SharedRebase $repo $script:Cfg.defaultBranch
             if (-not $res.Ok) {
                 Run-Git $repo @('rebase', '--abort') | Out-Null
-                throw "CONFLICT landing a leftover commit — you and a teammate changed the same file(s): $($res.Bad -join ', '). If those are world layers, you both worked the same layer - a human picks how to combine them. Your work is safe locally. STOP and post in the group chat."
+                throw "CONFLICT landing a leftover commit — you and a teammate changed the same file(s): $($res.Bad -join ', '). If those are world layers, you both worked the same layer - a human picks how to combine them. Your work is safe locally. STOP and post in the group chat. Once a teammate has landed the combined version, press START SESSION again - it syncs by itself."
             }
             if ($res.Resolved.Count -gt 0) {
                 $names = ($res.Resolved | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
@@ -3447,7 +3475,7 @@ function Show-Help {
         <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Stale world: Workbench only reads files when it LOADS. Foreman refuses to start/ship while it's open, so you never build on yesterday's map.&#10;•  Save-churn: every save re-serializes the '.ttile' for all ~1,155 tiles, and a 'Generate normal/vegetation map' rewrites every '_normal', even if you touched one tile. Shipping that bloats the repo and collides with everyone. Foreman ships the tiles you actually WORKED — sculpted (a '.bterr' change) or painted (a '_layer' change) — and drops the pure serialize/normal-regen churn; each machine rebuilds those locally.&#10;•  The unmergeable index: map/resourceDatabase.rdb can never merge between two people. Foreman keeps it out of your commits entirely; Workbench rebuilds it on your machine.&#10;•  Lost work: before SHIP (or START, or a stick tap) pushes, repairs or drops anything, Foreman backs up your whole session, every changed file except tile noise: once on this PC and once on GitHub (a hidden backup, not a branch). While Foreman is open it also backs up any unshipped work every 30 minutes, so even a dead PC loses half an hour at most. No backup, no ship. Then the only layer edits it leaves out are pure re-saves whose content is IDENTICAL to master's; any real change, like a moved road point or a nudged building, ships, whoever's name is on the layer. (Before v0.26 it judged by entity count, which silently dropped moved road points and nudges: that is how road fixes on Mike's side were lost in October.) Something missing after a ship? It's in a backup: see the README, 'Getting work back'.&#10;•  Prefab loss: if an addon the map depends on (the Fireforce props pack, usually) is missing or out of date on your computer, Workbench cannot find those prefabs and quietly STRIPS them from the layer when it saves - the objects stay but turn into invisible empty entities, and some (destructible walls and roofs) vanish. Shipping that wipes the objects for everyone; it cost the plantation and the station on 08/19 and 09/17. Doctor and START SESSION now name any prefab folder they can not find, and Foreman's PREFAB GUARD checks EVERY layer you changed (your own included) before it ships: it offers to REPAIR the links from the team copy on master, or DISCARD your edits to that layer, and there is no ship-anyway. Fix it at the source - update the addon, then START SESSION.&#10;•  Ship collisions: if a teammate shipped seconds before you, Foreman slots their work underneath yours automatically (different tiles = different files, they just merge). Even when you both re-saved the shared index files (the terrain header, tile-ownership map, resource index), Foreman auto-resolves them the proven way — master wins, Workbench rebuilds them on your next save, and it names every file it merged in the Activity log. It stops dead ONLY if you both changed the exact same file — the same terrain tile, or the same world layer (which is why two people shouldn't work the same layer at once). That's the one thing it won't guess. Then it tells you to ask in chat; your work stays safe on your machine."/>
 
         <TextBlock Text="THE RULES (short version)" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
-        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Work the layers of the area you're working, whatever name is on them; TAP IN before you touch a base layer.&#10;•  Positions come from the plan (world_coords.json / the 1:50k sheet) — don't invent locations.&#10;•  Foreman says '[STOP] CONFLICT'? Two people changed the same file. Your work is committed on your machine and safe. STOP and ask in the group chat — a human picks how to combine them.&#10;•  Not merged = not done. Ship small and often."/>
+        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Work the layers of the area you're working, whatever name is on them; TAP IN before you touch a base layer.&#10;•  Positions come from the plan (world_coords.json / the 1:50k sheet) — don't invent locations.&#10;•  Foreman says '[STOP] CONFLICT'? Two people changed the same file. Your work is committed on your machine and safe. STOP and ask in the group chat — a human picks how to combine them. Once they've landed the combined version, just press START SESSION: Foreman sees your work is already on the team map and syncs to it by itself.&#10;•  Not merged = not done. Ship small and often."/>
 
         <TextBlock Text="TROUBLESHOOTING" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
         <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,4" Text="•  A [STOP] message names its own fix — read it first.&#10;•  'No changes seen' but you definitely built? Workbench was editing a DUPLICATE copy, not your clone — run Doctor (it checks the link Workbench reads, which Foreman sets up by itself on every launch) and ask for help.&#10;•  Workbench shows an old map? Close it fully and reopen — and always START SESSION before opening it.&#10;•  Anything else weird: screenshot + group chat. Never push through a warning."/>
