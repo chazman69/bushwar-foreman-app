@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.29.0'
+$script:ForemanVersion = '0.29.1'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -3436,6 +3436,16 @@ $xaml = @'
         <TextBlock x:Name="lblSync" Text="" Foreground="#8a9585" HorizontalAlignment="Right"
                    ToolTip="Whether you have everything the team has shipped. If updates are waiting, START SESSION pulls them in."/>
         <TextBlock x:Name="lblVersion" Text="" Foreground="#6a7568" FontSize="11" HorizontalAlignment="Right" Margin="0,2,0,0"/>
+        <Button x:Name="btnSettings" Content="⚙  Settings" HorizontalAlignment="Right" Margin="0,4,0,0" Padding="8,2"
+                Background="#39423c" Foreground="#e8e4d8" BorderThickness="0" FontSize="11"
+                ToolTip="Settings for this PC only: turn the heads-up pop-ups and the ship-soon reminder on or off.">
+          <Button.ContextMenu>
+            <ContextMenu>
+              <MenuItem x:Name="mnuToasts" Header="Heads-up pop-ups (a teammate is changing or just shipped what you're changing)" IsCheckable="True"/>
+              <MenuItem x:Name="mnuNudge" Header="Ship-soon reminder after a few hours of unshipped work" IsCheckable="True"/>
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
       </StackPanel>
     </DockPanel>
 
@@ -3525,7 +3535,7 @@ try {
     $reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
     $window = [Windows.Markup.XamlReader]::Load($reader)
     $ui = @{}
-    foreach ($name in @('imgLogo','lblProject','lblRepo','lblIdentity','lblWorkbench','lblBranch','lblSync','lblVersion','lblNext','btnStart','btnShip','btnStick','btnRefresh','btnDoctor','btnHelp','lstPlan','txtSummary','btnConfirmShip','lstSessions','lstLanded','lstStick','lstClaims','txtLog')) {
+    foreach ($name in @('imgLogo','lblProject','lblRepo','lblIdentity','lblWorkbench','lblBranch','lblSync','lblVersion','lblNext','btnStart','btnShip','btnStick','btnRefresh','btnDoctor','btnHelp','btnSettings','lstPlan','txtSummary','btnConfirmShip','lstSessions','lstLanded','lstStick','lstClaims','txtLog')) {
         $ui[$name] = $window.FindName($name)
         if (-not $ui[$name]) { throw "UI element missing from XAML: $name" }
     }
@@ -3798,7 +3808,7 @@ function Show-Help {
         <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Stale world: Workbench only reads files when it LOADS. Foreman refuses to start/ship while it's open, so you never build on yesterday's map.&#10;•  Save-churn: every save re-serializes the '.ttile' for all ~1,155 tiles, and a 'Generate normal/vegetation map' rewrites every '_normal', even if you touched one tile. Shipping that bloats the repo and collides with everyone. Foreman ships the tiles you actually WORKED — sculpted (a '.bterr' change) or painted (a '_layer' change) — and drops the pure serialize/normal-regen churn; each machine rebuilds those locally.&#10;•  The unmergeable index: map/resourceDatabase.rdb can never merge between two people. Foreman keeps it out of your commits entirely; Workbench rebuilds it on your machine.&#10;•  Lost work: before SHIP (or START, or a stick tap) pushes, repairs or drops anything, Foreman backs up your whole session, every changed file except tile noise: once on this PC and once on GitHub (a hidden backup, not a branch). While Foreman is open it also backs up any unshipped work every 30 minutes, so even a dead PC loses half an hour at most. No backup, no ship. Then the only layer edits it leaves out are pure re-saves whose content is IDENTICAL to master's; any real change, like a moved road point or a nudged building, ships, whoever's name is on the layer. (Before v0.26 it judged by entity count, which silently dropped moved road points and nudges: that is how road fixes on Mike's side were lost in October.) Something missing after a ship? It's in a backup: see the README, 'Getting work back'.&#10;•  Prefab loss: if an addon the map depends on (the Fireforce props pack, usually) is missing or out of date on your computer, Workbench cannot find those prefabs and quietly STRIPS them from the layer when it saves - the objects stay but turn into invisible empty entities, and some (destructible walls and roofs) vanish. Shipping that wipes the objects for everyone; it cost the plantation and the station on 08/19 and 09/17. Doctor and START SESSION now name any prefab folder they can not find, and Foreman's PREFAB GUARD checks EVERY layer you changed (your own included) before it ships: it offers to REPAIR the links from the team copy on master, or DISCARD your edits to that layer, and there is no ship-anyway. Fix it at the source - update the addon, then START SESSION.&#10;•  Ship collisions: if a teammate shipped seconds before you, Foreman slots their work underneath yours automatically (different tiles = different files, they just merge). Even when you both re-saved the shared index files (the terrain header, tile-ownership map, resource index), Foreman auto-resolves them the proven way — master wins, Workbench rebuilds them on your next save, and it names every file it merged in the Activity log. And if you both changed the same world LAYER, Foreman (v0.29) combines the two: it keeps everyone's changes only after checking, entity by entity, that the result is exactly the layer plus both people's edits, with no two objects sharing a name (that crashes Workbench). If one side was just a Workbench re-save, it keeps the other. It stops dead ONLY when you both changed the very same objects, or the same terrain tile (two sculpts of one spot can't be combined). That's the one thing it won't guess. Then it tells you to ask in chat; your work stays safe on your machine."/>
 
         <TextBlock Text="THE RULES (short version)" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
-        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Work the layers of the area you're working, whatever name is on them; TAP IN before you touch a base layer.&#10;•  Positions come from the plan (world_coords.json / the 1:50k sheet) — don't invent locations.&#10;•  Heads-up pop-ups (Windows notifications): Foreman tells you when a teammate is changing, or just shipped, a layer or tile you're also changing, and nudges you after 3 hours of unshipped work. When one pops up, ship soon or agree in chat who goes first. It's how clashes stay small.&#10;•  Foreman says '[STOP] CONFLICT'? You and a teammate changed the very same objects (or the same terrain tile), so it couldn't combine them by itself. Your work is committed on your machine and safe. STOP and ask in the group chat — a human picks how to combine them. Once they've landed the combined version, just press START SESSION: Foreman sees your work is already on the team map and syncs to it by itself.&#10;•  Not merged = not done. Ship small and often."/>
+        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Work the layers of the area you're working, whatever name is on them; TAP IN before you touch a base layer.&#10;•  Positions come from the plan (world_coords.json / the 1:50k sheet) — don't invent locations.&#10;•  Heads-up pop-ups (Windows notifications): Foreman tells you when a teammate is changing, or just shipped, a layer or tile you're also changing, and nudges you after 3 hours of unshipped work. When one pops up, ship soon or agree in chat who goes first. It's how clashes stay small. Don't want them? Turn them off under ⚙ Settings (top right).&#10;•  Foreman says '[STOP] CONFLICT'? You and a teammate changed the very same objects (or the same terrain tile), so it couldn't combine them by itself. Your work is committed on your machine and safe. STOP and ask in the group chat — a human picks how to combine them. Once they've landed the combined version, just press START SESSION: Foreman sees your work is already on the team map and syncs to it by itself.&#10;•  Not merged = not done. Ship small and often."/>
 
         <TextBlock Text="TROUBLESHOOTING" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
         <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,4" Text="•  A [STOP] message names its own fix — read it first.&#10;•  'No changes seen' but you definitely built? Workbench was editing a DUPLICATE copy, not your clone — run Doctor (it checks the link Workbench reads, which Foreman sets up by itself on every launch) and ask for help.&#10;•  Workbench shows an old map? Close it fully and reopen — and always START SESSION before opening it.&#10;•  Anything else weird: screenshot + group chat. Never push through a warning."/>
@@ -4005,6 +4015,32 @@ $ui.btnDoctor.Add_Click({ Run-Doctor })
 
 $ui.btnHelp.Add_Click({ Show-Help })
 
+# SETTINGS (v0.29.1): per-PC switches, saved in local.json - nobody edits JSON by hand.
+# ContextMenu items live outside the window's name scope, so they're found through the menu.
+$script:SettingsMenu = $ui.btnSettings.ContextMenu
+$script:MnuToasts = $script:SettingsMenu.Items | Where-Object { $_.Name -eq 'mnuToasts' }
+$script:MnuNudge = $script:SettingsMenu.Items | Where-Object { $_.Name -eq 'mnuNudge' }
+function Set-LocalSwitch([string]$name, [bool]$on) {
+    if (-not $script:Local) { return }
+    $script:Local | Add-Member -NotePropertyName $name -NotePropertyValue $on -Force
+    try { Save-LocalConfig $script:Local } catch { Log "[WARN] Couldn't save the setting: $($_.Exception.Message)" }
+}
+$ui.btnSettings.Add_Click({
+    $script:MnuToasts.IsChecked = -not ($script:Local -and $script:Local.PSObject.Properties['toasts'] -and $script:Local.toasts -eq $false)
+    $script:MnuNudge.IsChecked = -not ($script:Local -and $script:Local.PSObject.Properties['shipNudge'] -and $script:Local.shipNudge -eq $false)
+    $script:SettingsMenu.PlacementTarget = $ui.btnSettings
+    $script:SettingsMenu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $script:SettingsMenu.IsOpen = $true
+})
+$script:MnuToasts.Add_Click({
+    Set-LocalSwitch 'toasts' ([bool]$script:MnuToasts.IsChecked)
+    if ($script:MnuToasts.IsChecked) { Log 'Heads-up pop-ups are ON for this PC.' } else { Log 'Heads-up pop-ups are OFF for this PC (warnings still go in this log).' }
+})
+$script:MnuNudge.Add_Click({
+    Set-LocalSwitch 'shipNudge' ([bool]$script:MnuNudge.IsChecked)
+    if ($script:MnuNudge.IsChecked) { Log 'Ship-soon reminder is ON for this PC.' } else { Log 'Ship-soon reminder is OFF for this PC.' }
+})
+
 # Workbench watcher: keeps the NEXT hint honest, and the moment Workbench closes
 # after a build it refreshes the plan and nudges toward SHIP.
 $script:WbPrev = Get-WorkbenchRunning
@@ -4101,7 +4137,7 @@ function Test-GateEarlyWarning {
 #     changes; the background fetch reads everyone else's;
 #  3. you've had unshipped work for warnings.shipNudgeHours (default 3) - ship small and often.
 # Everything also goes in the Activity log. Off for the team: "warnings" in
-# foreman.config.json; off on one PC: "toasts": false in local.json.
+# foreman.config.json; off on one PC: the Settings button (saved as "toasts"/"shipNudge" in local.json).
 function Get-WarnCfg {
     $c = @{ Toasts = $true; Presence = $true; Prefix = 'refs/presence'; MaxHours = 12; NudgeHours = 3.0 }
     if ($script:Cfg -and $script:Cfg.PSObject.Properties['warnings']) {
@@ -4113,6 +4149,7 @@ function Get-WarnCfg {
         if ($w.PSObject.Properties['shipNudgeHours']) { $c.NudgeHours = [double]$w.shipNudgeHours }
     }
     if ($script:Local -and $script:Local.PSObject.Properties['toasts'] -and $script:Local.toasts -eq $false) { $c.Toasts = $false }
+    if ($script:Local -and $script:Local.PSObject.Properties['shipNudge'] -and $script:Local.shipNudge -eq $false) { $c.NudgeHours = 0 }
     return $c
 }
 
