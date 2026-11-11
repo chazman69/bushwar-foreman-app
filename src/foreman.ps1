@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.28.3'
+$script:ForemanVersion = '0.28.4'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -857,10 +857,30 @@ function Get-LeftoverLandedBy([string]$repo, [string]$branch) {
     $by = @()
     foreach ($s in $shas) {
         $hit = (Run-Git $repo @('log', "origin/$branch", '-n', '1', '--format=%h', '--fixed-strings', "--grep=Lands-for: $s")).Out
-        if (-not $hit -or -not $hit.Trim()) { return $null }
+        if (-not $hit -or -not $hit.Trim()) { $by = $null; break }
         $by += $hit.Trim()
     }
-    return (($by | Select-Object -Unique) -join ', ')
+    if ($by) { return (($by | Select-Object -Unique) -join ', ') }
+    # v0.28.4: the commit a SHIP makes after its backup exists only on the builder's PC,
+    # so whoever combines it by hand can only name the GitHub backup it came from:
+    # "Lands-for: refs/backup/<me>/<stamp>". Covered when that backup's map/ matches
+    # this PC's HEAD exactly (any later work on this PC makes them differ = not covered).
+    $prefix = "$((Get-BackupCfg).Prefix)/$(Get-BackupOwner)/"
+    $marks = (Run-Git $repo @('log', "origin/$branch", '-n', '200', '--format=@@LANDS@@ %h%n%B', '--fixed-strings', "--grep=Lands-for: $prefix")).Out
+    if (-not $marks) { return $null }
+    $cur = ''
+    foreach ($line in ($marks -split "`r?`n")) {
+        if ($line -match '^@@LANDS@@ ([0-9a-f]{7,40})$') { $cur = $Matches[1]; continue }
+        if ($line -match ('^Lands-for: (' + [regex]::Escape($prefix) + '[0-9-]+)\s*$')) {
+            $ref = $Matches[1]
+            $f = Run-Git $repo @('fetch', '--quiet', '--no-tags', 'origin', "+$($ref):refs/foreman/lands-for")
+            if ($f.Code -ne 0) { continue }
+            $d = Run-Git $repo @('diff', '--quiet', 'refs/foreman/lands-for', 'HEAD', '--', 'map')
+            Run-Git $repo @('update-ref', '-d', 'refs/foreman/lands-for') | Out-Null
+            if ($d.Code -eq 0) { return $cur }
+        }
+    }
+    return $null
 }
 
 function Test-RebaseInProgress([string]$repo) {
@@ -2829,7 +2849,7 @@ function Invoke-Ship {
             $res = Resolve-SharedRebase $repo $master
             if (-not $res.Ok) {
                 Run-Git $repo @('rebase', '--abort') | Out-Null
-                throw "CONFLICT: you and a teammate changed the same file(s): $($res.Bad -join ', '). Your work is committed locally and safe. If those are world layers, you both worked the same layer; if they're terrain tiles, you both sculpted the same spot. A human picks how to combine them - nothing was overwritten. STOP and post in the group chat — do not retry."
+                throw "CONFLICT: you and a teammate changed the same file(s): $($res.Bad -join ', '). Your work is committed locally and safe. If those are world layers, you both worked the same layer; if they're terrain tiles, you both sculpted the same spot. A human picks how to combine them - nothing was overwritten. STOP and post in the group chat. Once a teammate has landed the combined version, press START SESSION - it syncs by itself."
             }
             if ($res.Resolved.Count -gt 0) {
                 $names = ($res.Resolved | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
