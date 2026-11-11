@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.28.4'
+$script:ForemanVersion = '0.29.0'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -933,6 +933,64 @@ function Get-HeaderOnlyLayerSide([string]$repo, [string]$path) {
     }
 }
 
+function Format-CombineWhy($res) {
+    # " (Joe_Vegetation.layer: you both changed the same entities)" - why auto-combine passed
+    if (-not $res -or -not $res.Why -or $res.Why.Count -eq 0) { return '' }
+    $parts = @($res.Why.Keys | ForEach-Object { "$(Split-Path $_ -Leaf): $($res.Why[$_])" })
+    return " (auto-combine couldn't: $($parts -join '; '))"
+}
+
+function Merge-LayerProven([string]$repo, [string]$path) {
+    # v0.29 AUTO-COMBINE. A rebase paused on a .layer both sides really changed. Returns
+    # @{ Side = 'ours'|'theirs'|'combined'; Detail = '...' } once the file in the working
+    # tree is resolved and staged, or @{ Side = $null; Detail = why-not }. Rules:
+    #  - one side holds the same world as the start (a Workbench re-save, any regrouping or
+    #    float jitter): keep the other side. Builder re-save first, so master wins a tie.
+    #  - both changed it: merge-file the text (headers aligned to master's first), then keep
+    #    the result ONLY if [Bushwar.LayerMerge+Three].Check says it is exactly the start + both
+    #    people's changes with no new duplicate names. Otherwise a human picks, as before.
+    $r = Run-Git $repo @('checkout-index', '--stage=all', '--temp', '--', $path)
+    if ($r.Code -ne 0 -or $r.Out -notmatch '^(\S+) (\S+) (\S+)\t') { return @{ Side = $null; Detail = 'not a plain two-sided change' } }
+    $tmp = @($Matches[1], $Matches[2], $Matches[3])
+    if ($tmp -contains '.') {
+        foreach ($t in $tmp) { if ($t -ne '.') { Remove-Item -LiteralPath (Join-Path $repo $t) -Force -ErrorAction SilentlyContinue } }
+        return @{ Side = $null; Detail = 'one side added or deleted the whole layer' }
+    }
+    $base = Join-Path $repo $tmp[0]; $ours = Join-Path $repo $tmp[1]; $theirs = Join-Path $repo $tmp[2]
+    $work = Join-Path $env:TEMP ("foreman-merge-{0}" -f [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        Initialize-LayerScan
+        $three = New-Object 'Bushwar.LayerMerge+Three' -ArgumentList $base, $ours, $theirs
+        if ($three.TheirsChanged -eq 0) {
+            Run-Git $repo @('checkout', '--ours', '--', $path) | Out-Null      # --ours == master during a rebase
+            Run-Git $repo @('add', '--', $path) | Out-Null
+            return @{ Side = 'ours'; Detail = 'your side was only a Workbench re-save - kept the team version' }
+        }
+        if ($three.OursChanged -eq 0) {
+            Run-Git $repo @('checkout', '--theirs', '--', $path) | Out-Null
+            Run-Git $repo @('add', '--', $path) | Out-Null
+            return @{ Side = 'theirs'; Detail = "the teammate's side was only a Workbench re-save - kept yours" }
+        }
+        $b2 = Join-Path $work 'base.layer'; $t2 = Join-Path $work 'theirs.layer'; $m = Join-Path $work 'merged.layer'
+        [Bushwar.LayerMerge]::CopyWithHeader($base, $ours, $b2)
+        [Bushwar.LayerMerge]::CopyWithHeader($theirs, $ours, $t2)
+        Copy-Item -LiteralPath $ours -Destination $m -Force
+        $mr = Run-Git $repo @('merge-file', '-q', $m, $b2, $t2)
+        if ($mr.Code -ne 0) { return @{ Side = $null; Detail = 'you both changed the same entities' } }
+        $proof = $three.Check($m)
+        if ($proof -ne 'OK') { return @{ Side = $null; Detail = $proof } }
+        Copy-Item -LiteralPath $m -Destination (Join-Path $repo $path) -Force
+        Run-Git $repo @('add', '--', $path) | Out-Null
+        return @{ Side = 'combined'; Detail = "combined your changes with the team's, checked entity by entity" }
+    } catch {
+        return @{ Side = $null; Detail = "couldn't check it ($($_.Exception.Message))" }
+    } finally {
+        foreach ($f in @($base, $ours, $theirs)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Resolve-SharedRebase([string]$repo, [string]$master) {
     # A rebase has paused on conflict. Proven merge model (collaboration/terrain-sculpting.md,
     # verified live in PR #82): sculpt geometry lives in disjoint per-tile files and never
@@ -945,6 +1003,10 @@ function Resolve-SharedRebase([string]$repo, [string]$master) {
     $shared = @($script:Cfg.terrain.sharedRegenFiles)
     $resolved = @{}
     $layers = @{}
+    $combined = @{}   # v0.29: path -> what auto-combine did
+    $why = @{}        # v0.29: path -> why it couldn't
+    $autoCombine = $true
+    if ($script:Cfg.PSObject.Properties['autoCombineLayers'] -and $script:Cfg.autoCombineLayers -eq $false) { $autoCombine = $false }
     $guard = 0
     while (Test-RebaseInProgress $repo) {
         if ($guard++ -gt 200) { return @{ Ok = $false; Bad = @('(rebase did not converge)') } }
@@ -957,16 +1019,26 @@ function Resolve-SharedRebase([string]$repo, [string]$master) {
             # the real edits (Malvia vs Hyrax on default.layer, 2026-11-09).
             $layerPicked = @{}   # path -> side kept, for this paused commit
             foreach ($p in @($unmerged | Where-Object { $shared -notcontains $_ -and $_ -like '*.layer' })) {
-                $side = Get-HeaderOnlyLayerSide $repo $p
+                $side = $null
+                if (-not $autoCombine) { $side = Get-HeaderOnlyLayerSide $repo $p }   # line walk in PowerShell: slow on big layers; the entity check below covers it
                 if ($side) {
                     Run-Git $repo @('checkout', "--$side", '--', $p) | Out-Null
                     Run-Git $repo @('add', '--', $p) | Out-Null
                     $layerPicked[$p] = $side
+                    continue
+                }
+                if (-not $autoCombine) { continue }
+                $mg = Merge-LayerProven $repo $p
+                if ($mg.Side) {
+                    $layerPicked[$p] = $mg.Side
+                    $combined[$p] = $mg.Detail
+                } else {
+                    $why[$p] = $mg.Detail
                 }
             }
             $bad = @($unmerged | Where-Object { $shared -notcontains $_ -and -not $layerPicked.ContainsKey($_) })
-            if ($bad.Count -gt 0) { return @{ Ok = $false; Bad = $bad } }
-            foreach ($k in $layerPicked.Keys) { $layers[$k] = $layerPicked[$k] }
+            if ($bad.Count -gt 0) { return @{ Ok = $false; Bad = $bad; Why = $why } }
+            foreach ($k in $layerPicked.Keys) { if (-not $combined.ContainsKey($k)) { $layers[$k] = $layerPicked[$k] } }
             foreach ($p in @($unmerged | Where-Object { -not $layerPicked.ContainsKey($_) })) {
                 Run-Git $repo @('checkout', '--ours', '--', $p) | Out-Null   # --ours == master during a rebase
                 Run-Git $repo @('add', '--', $p) | Out-Null
@@ -991,7 +1063,7 @@ function Resolve-SharedRebase([string]$repo, [string]$master) {
             }
         }
     }
-    return @{ Ok = $true; Resolved = @($resolved.Keys); Layers = $layers }
+    return @{ Ok = $true; Resolved = @($resolved.Keys); Layers = $layers; Combined = $combined }
 }
 
 function Get-RepoState {
@@ -1091,7 +1163,7 @@ function Invoke-StartSession {
             $res = Resolve-SharedRebase $repo $script:Cfg.defaultBranch
             if (-not $res.Ok) {
                 Run-Git $repo @('rebase', '--abort') | Out-Null
-                throw "CONFLICT landing a leftover commit — you and a teammate changed the same file(s): $($res.Bad -join ', '). If those are world layers, you both worked the same layer - a human picks how to combine them. Your work is safe locally. STOP and post in the group chat. Once a teammate has landed the combined version, press START SESSION again - it syncs by itself."
+                throw "CONFLICT landing a leftover commit — you and a teammate changed the same file(s): $($res.Bad -join ', ')$(Format-CombineWhy $res). If those are world layers, you both worked the same layer - a human picks how to combine them. Your work is safe locally. STOP and post in the group chat. Once a teammate has landed the combined version, press START SESSION again - it syncs by itself."
             }
             if ($res.Resolved.Count -gt 0) {
                 $names = ($res.Resolved | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
@@ -1100,6 +1172,9 @@ function Invoke-StartSession {
             if ($res.Layers -and $res.Layers.Count -gt 0) {
                 $names = ($res.Layers.Keys | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
                 $notes += "[FIX] $names clashed only in Workbench's auto-generated header (BSP/bounds) - kept the side with the real edits, nothing lost; Workbench rebuilds the header on next save."
+            }
+            if ($res.Combined -and $res.Combined.Count -gt 0) {
+                foreach ($k in $res.Combined.Keys) { $notes += "[FIX] AUTO-COMBINE $(Split-Path $k -Leaf): you and a teammate both changed it - $($res.Combined[$k]). Nothing lost." }
             }
         }
         $r = Run-Git $repo @('push', 'origin', $script:Cfg.defaultBranch)
@@ -2190,6 +2265,229 @@ namespace Bushwar
             catch (Exception) { return false; }
         }
     }
+
+    // v0.29 AUTO-COMBINE: two people changed the same layer (2026-11-11: Joe's park vs
+    // Hyrax's riverbed, twice). git merge-file combines the text; this proves the result
+    // is EXACTLY the starting layer plus both people's changes, entity by entity, and that
+    // it doesn't hold two entities with one name (the known load crash). Anything short of
+    // that and Foreman stops like before. Workbench's regenerated header (BSP/bounds) is
+    // ignored and taken from master's side - Workbench rebuilds it on the next save.
+    public static class LayerMerge
+    {
+        const ulong Fnv0 = 14695981039346656037UL;
+        static ulong H(ulong h, char c) { h ^= c; return h * 1099511628211UL; }
+        static ulong H(ulong h, string s, int a, int b) { for (int k = a; k < b; k++) { h ^= s[k]; h *= 1099511628211UL; } return h; }
+        static bool At(string s, int a, int b, string w) { return b - a >= w.Length && string.CompareOrdinal(s, a, w, 0, w.Length) == 0; }
+        static bool IsHeaderLine(string s, int a, int b)
+        {
+            string[] keys = { "BSP", "boundMins", "boundMaxs" };
+            foreach (string k in keys)
+                if (At(s, a, b, k) && (b - a == k.Length || s[a + k.Length] == ' ' || s[a + k.Length] == '\t')) return true;
+            return false;
+        }
+        static void Bump(Dictionary<ulong, int> c, ulong h) { int n; c.TryGetValue(h, out n); c[h] = n + 1; }
+        static void BumpName(Dictionary<string, int> names, string nm) { if (names == null || nm.Length == 0) return; int n; names.TryGetValue(nm, out n); names[nm] = n + 1; }
+
+        // Entity records -> count, in ONE pass with no per-line copies (the vegetation layer is
+        // ~87 MB / 5 M lines; LayerCanon.Records takes ~30 s on it). Same record shape as
+        // LayerCanon (a lone top-level entity, or one child of a $grp block, with its whole
+        // body), but compared as exact text: merge-file copies lines byte for byte, so the
+        // proof needs no float rounding. CRLF/LF and indentation are ignored; the
+        // BSP/boundMins/boundMaxs header lines are left out. Names of named entities -> count.
+        static Dictionary<ulong, int> Count(string path, Dictionary<string, int> names)
+        {
+            string s = File.ReadAllText(path, Encoding.UTF8);
+            Dictionary<ulong, int> c = new Dictionary<ulong, int>(1 << 16);
+            int i = 0, n = s.Length, mode = 0, depth = 0;   // mode 0 top, 1 lone entity, 2 in $grp, 3 $grp child
+            ulong h = 0, gh = 0;
+            while (i < n)
+            {
+                int e = s.IndexOf('\n', i); if (e < 0) e = n;
+                int a = i, b = e;
+                i = e + 1;
+                if (b > a && s[b - 1] == '\r') b--;
+                bool col0 = a < b && s[a] != ' ' && s[a] != '\t';
+                while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+                while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) b--;
+                if (a == b) continue;
+                if (IsHeaderLine(s, a, b)) continue;   // Workbench regenerates these, wherever they sit (default.layer keeps them inside its world { } block)
+                int d = 0;
+                for (int k = a; k < b; k++) { char ch = s[k]; if (ch == '{') d++; else if (ch == '}') d--; }
+                bool opens = s[b - 1] == '{';
+                if (mode == 0)
+                {
+                    if (col0 && opens)
+                    {
+                        if (At(s, a, b, "$grp ")) { mode = 2; gh = H(Fnv0, s, a, b); depth = 1; }
+                        else
+                        {
+                            h = H(Fnv0, s, a, b); depth = d; mode = 1;
+                            // "Class Name : \"{GUID}path\" {" -> Name
+                            string hdr = s.Substring(a, b - a - 1).Trim();
+                            int colon = hdr.IndexOf(" : ", StringComparison.Ordinal);
+                            if (colon >= 0) hdr = hdr.Substring(0, colon);
+                            int sp = hdr.IndexOf(' ');
+                            if (sp > 0) BumpName(names, hdr.Substring(sp + 1).Trim());
+                            if (depth <= 0) { Bump(c, h); mode = 0; }
+                        }
+                    }
+                    else if (!IsHeaderLine(s, a, b)) Bump(c, H(H(Fnv0, '?'), s, a, b));
+                }
+                else if (mode == 1)
+                {
+                    h = H(H(h, '\n'), s, a, b); depth += d;
+                    if (depth <= 0) { Bump(c, h); mode = 0; }
+                }
+                else if (mode == 2)
+                {
+                    if (col0 && b - a == 1 && s[a] == '}') { mode = 0; continue; }   // end of the group
+                    if (opens)
+                    {
+                        h = H(H(gh, '|'), s, a, b); depth = 1 + d; mode = 3;
+                        if (b - a > 1) BumpName(names, s.Substring(a, b - a - 1).Trim());
+                        if (depth <= 1) { Bump(c, h); mode = 2; }
+                    }
+                    else Bump(c, H(H(gh, '?'), s, a, b));
+                }
+                else
+                {
+                    h = H(H(h, '\n'), s, a, b); depth += d;
+                    if (depth <= 1) { Bump(c, h); mode = 2; }
+                }
+            }
+            if (mode == 1 || mode == 3) Bump(c, h);   // unterminated block: still counted, so a damaged file can't hide
+            return c;
+        }
+
+        static Dictionary<ulong, int> Delta(Dictionary<ulong, int> side, Dictionary<ulong, int> baseC)
+        {
+            Dictionary<ulong, int> d = new Dictionary<ulong, int>();
+            foreach (KeyValuePair<ulong, int> kv in side)
+            {
+                int b; baseC.TryGetValue(kv.Key, out b);
+                if (kv.Value != b) d[kv.Key] = kv.Value - b;
+            }
+            foreach (KeyValuePair<ulong, int> kv in baseC)
+                if (!side.ContainsKey(kv.Key)) d[kv.Key] = -kv.Value;
+            return d;
+        }
+
+        static int Size(Dictionary<ulong, int> d)
+        {
+            int s = 0;
+            foreach (int v in d.Values) s += Math.Abs(v);
+            return s;
+        }
+
+        // One three-way look at a clashed layer: each version is parsed ONCE (the
+        // vegetation layer is ~87 MB). Header lines are left out, so the counts are the same
+        // for a copy whose header CopyWithHeader replaced.
+        public sealed class Three
+        {
+            Dictionary<ulong, int> dO, dT;
+            Dictionary<string, int> nO, nT;
+            public int OursChanged { get { return Size(dO); } }
+            public int TheirsChanged { get { return Size(dT); } }
+
+            public Three(string basePath, string oursPath, string theirsPath)
+            {
+                Dictionary<ulong, int> b = Count(basePath, null);
+                nO = new Dictionary<string, int>(StringComparer.Ordinal);
+                nT = new Dictionary<string, int>(StringComparer.Ordinal);
+                dO = Delta(Count(oursPath, nO), b);
+                dT = Delta(Count(theirsPath, nT), b);
+                mBase = b;
+            }
+            Dictionary<ulong, int> mBase;
+
+            // "OK" when merged == base + both deltas and no new duplicate names, else why not
+            public string Check(string mergedPath)
+            {
+                try
+                {
+                    Dictionary<string, int> nM = new Dictionary<string, int>(StringComparer.Ordinal);
+                    Dictionary<ulong, int> dM = Delta(Count(mergedPath, nM), mBase);
+                    // what a 3-way merge should give: both deltas, except a change BOTH people
+                    // made the same way counts once (merge-file keeps an identical edit once)
+                    Dictionary<ulong, int> want = new Dictionary<ulong, int>(dO);
+                    foreach (KeyValuePair<ulong, int> kv in dT)
+                    {
+                        int w; want.TryGetValue(kv.Key, out w);
+                        int v;
+                        if (w != 0 && Math.Sign(w) == Math.Sign(kv.Value)) v = Math.Sign(w) * Math.Max(Math.Abs(w), Math.Abs(kv.Value));
+                        else v = w + kv.Value;
+                        if (v == 0) want.Remove(kv.Key); else want[kv.Key] = v;
+                    }
+                    int off = 0;
+                    foreach (KeyValuePair<ulong, int> kv in want)
+                    {
+                        int m; dM.TryGetValue(kv.Key, out m);
+                        if (m != kv.Value) off += Math.Abs(m - kv.Value);
+                    }
+                    foreach (KeyValuePair<ulong, int> kv in dM)
+                        if (!want.ContainsKey(kv.Key)) off += Math.Abs(kv.Value);
+                    if (off > 0) return "the combined layer doesn't add up to both people's changes (" + off + " entities off)";
+                    foreach (KeyValuePair<string, int> kv in nM)
+                    {
+                        if (kv.Value < 2) continue;
+                        int o, t; nO.TryGetValue(kv.Key, out o); nT.TryGetValue(kv.Key, out t);
+                        if (kv.Value > Math.Max(o, t)) return "two entities would both be named '" + kv.Key + "' (Workbench crashes on that)";
+                    }
+                    return "OK";
+                }
+                catch (Exception e) { return "couldn't read the combined layer (" + e.Message + ")"; }
+            }
+        }
+
+        // copy src to dst with its BSP/boundMins/boundMaxs lines (first 12 lines) replaced by
+        // hdrFrom's, byte for byte everywhere else - so merge-file never trips on the header
+        public static void CopyWithHeader(string src, string hdrFrom, string dst)
+        {
+            Dictionary<string, byte[]> want = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            byte[] h = File.ReadAllBytes(hdrFrom);
+            int pos = 0;
+            for (int line = 0; line < 12 && pos < h.Length; line++)
+            {
+                int e = Array.IndexOf(h, (byte)'\n', pos); if (e < 0) e = h.Length;
+                string key = HdrKey(h, pos, e);
+                if (key != null && !want.ContainsKey(key)) { byte[] l = new byte[e - pos]; Array.Copy(h, pos, l, 0, e - pos); want[key] = l; }
+                pos = e + 1;
+            }
+            byte[] s = File.ReadAllBytes(src);
+            using (FileStream o = new FileStream(dst, FileMode.Create, FileAccess.Write))
+            {
+                pos = 0;
+                for (int line = 0; line < 12 && pos < s.Length; line++)
+                {
+                    int e = Array.IndexOf(s, (byte)'\n', pos); if (e < 0) e = s.Length;
+                    string key = HdrKey(s, pos, e);
+                    byte[] rep;
+                    if (key != null && want.TryGetValue(key, out rep)) o.Write(rep, 0, rep.Length);
+                    else o.Write(s, pos, e - pos);
+                    if (e < s.Length) o.WriteByte((byte)'\n');
+                    pos = e + 1;
+                }
+                if (pos < s.Length) o.Write(s, pos, s.Length - pos);
+            }
+        }
+
+        static string HdrKey(byte[] b, int from, int to)
+        {
+            int k = from;
+            while (k < to && (b[k] == ' ' || b[k] == '\t')) k++;
+            string[] keys = { "BSP", "boundMins", "boundMaxs" };
+            foreach (string key in keys)
+            {
+                if (to - k < key.Length) continue;
+                bool ok = true;
+                for (int j = 0; j < key.Length; j++) if (b[k + j] != key[j]) { ok = false; break; }
+                if (!ok) continue;
+                int after = k + key.Length;
+                if (after == to || b[after] == ' ' || b[after] == '\t' || b[after] == '\r') return key;
+            }
+            return null;
+        }
+    }
 }
 '@
 
@@ -2849,7 +3147,7 @@ function Invoke-Ship {
             $res = Resolve-SharedRebase $repo $master
             if (-not $res.Ok) {
                 Run-Git $repo @('rebase', '--abort') | Out-Null
-                throw "CONFLICT: you and a teammate changed the same file(s): $($res.Bad -join ', '). Your work is committed locally and safe. If those are world layers, you both worked the same layer; if they're terrain tiles, you both sculpted the same spot. A human picks how to combine them - nothing was overwritten. STOP and post in the group chat. Once a teammate has landed the combined version, press START SESSION - it syncs by itself."
+                throw "CONFLICT: you and a teammate changed the same file(s): $($res.Bad -join ', ')$(Format-CombineWhy $res). Your work is committed locally and safe. If those are world layers, you both worked the same layer; if they're terrain tiles, you both sculpted the same spot. A human picks how to combine them - nothing was overwritten. STOP and post in the group chat. Once a teammate has landed the combined version, press START SESSION - it syncs by itself."
             }
             if ($res.Resolved.Count -gt 0) {
                 $names = ($res.Resolved | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
@@ -2858,6 +3156,9 @@ function Invoke-Ship {
             if ($res.Layers -and $res.Layers.Count -gt 0) {
                 $names = ($res.Layers.Keys | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
                 $notes += "[FIX] $names clashed only in Workbench's auto-generated header (BSP/bounds) - kept the side with the real edits, nothing lost; Workbench rebuilds the header on next save."
+            }
+            if ($res.Combined -and $res.Combined.Count -gt 0) {
+                foreach ($k in $res.Combined.Keys) { $notes += "[FIX] AUTO-COMBINE $(Split-Path $k -Leaf): you and a teammate both changed it - $($res.Combined[$k]). Nothing lost." }
             }
         }
         # stick GATE, second look: did someone tap in while we were shipping? (the pull
@@ -3269,9 +3570,11 @@ function Invoke-Busy([string]$msg, [scriptblock]$work) {
     $ui.lblNext.Text = 'Working... (Foreman may look frozen for a bit - leave it open)'
     $ui.lblNext.Foreground = '#cfd6c8'
     $window.Dispatcher.Invoke([action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
+    $script:InBusy = $true
     try {
         & $work
     } finally {
+        $script:InBusy = $false
         # restore at idle priority: clicks queued while frozen land on disabled buttons
         $window.Dispatcher.BeginInvoke([action]{
             foreach ($b in $script:BusyButtons) { $ui[$b].IsEnabled = $script:BusyWas[$b] }
@@ -3492,10 +3795,10 @@ function Show-Help {
         <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="The BASE layers (default, Forests, Vegetation, Water and the road layers) are one file each for the whole map, so everyone's areas meet in them, and two people's edits to one of them can never be combined: one person would have to redo their work by hand. So before you work one, hit TAP IN. While you hold the stick, nobody else's base-layer edits can ship (theirs wait on their PC, nothing is dropped), and if you change a base layer while someone else holds it, Foreman warns you within seconds of the save and SHIP waits until they hand it back. Forgot to tap in? If the stick is still free when you ship, your base-layer edits just ship. SHIPPING HANDS THE STICK BACK AUTOMATICALLY (tap out by hand only if you stop without shipping). Tap in right after START SESSION (never on a stale map) and hold it for a session, not a week. One quirk: base-layer trees come from a generator; if a generator re-runs, hand-deleted trees can grow back. For a permanent clearing, cut your pad out of the forest SHAPE."/>
 
         <TextBlock Text="WHAT FOREMAN PROTECTS YOU FROM (all learned the hard way)" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
-        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Stale world: Workbench only reads files when it LOADS. Foreman refuses to start/ship while it's open, so you never build on yesterday's map.&#10;•  Save-churn: every save re-serializes the '.ttile' for all ~1,155 tiles, and a 'Generate normal/vegetation map' rewrites every '_normal', even if you touched one tile. Shipping that bloats the repo and collides with everyone. Foreman ships the tiles you actually WORKED — sculpted (a '.bterr' change) or painted (a '_layer' change) — and drops the pure serialize/normal-regen churn; each machine rebuilds those locally.&#10;•  The unmergeable index: map/resourceDatabase.rdb can never merge between two people. Foreman keeps it out of your commits entirely; Workbench rebuilds it on your machine.&#10;•  Lost work: before SHIP (or START, or a stick tap) pushes, repairs or drops anything, Foreman backs up your whole session, every changed file except tile noise: once on this PC and once on GitHub (a hidden backup, not a branch). While Foreman is open it also backs up any unshipped work every 30 minutes, so even a dead PC loses half an hour at most. No backup, no ship. Then the only layer edits it leaves out are pure re-saves whose content is IDENTICAL to master's; any real change, like a moved road point or a nudged building, ships, whoever's name is on the layer. (Before v0.26 it judged by entity count, which silently dropped moved road points and nudges: that is how road fixes on Mike's side were lost in October.) Something missing after a ship? It's in a backup: see the README, 'Getting work back'.&#10;•  Prefab loss: if an addon the map depends on (the Fireforce props pack, usually) is missing or out of date on your computer, Workbench cannot find those prefabs and quietly STRIPS them from the layer when it saves - the objects stay but turn into invisible empty entities, and some (destructible walls and roofs) vanish. Shipping that wipes the objects for everyone; it cost the plantation and the station on 08/19 and 09/17. Doctor and START SESSION now name any prefab folder they can not find, and Foreman's PREFAB GUARD checks EVERY layer you changed (your own included) before it ships: it offers to REPAIR the links from the team copy on master, or DISCARD your edits to that layer, and there is no ship-anyway. Fix it at the source - update the addon, then START SESSION.&#10;•  Ship collisions: if a teammate shipped seconds before you, Foreman slots their work underneath yours automatically (different tiles = different files, they just merge). Even when you both re-saved the shared index files (the terrain header, tile-ownership map, resource index), Foreman auto-resolves them the proven way — master wins, Workbench rebuilds them on your next save, and it names every file it merged in the Activity log. It stops dead ONLY if you both changed the exact same file — the same terrain tile, or the same world layer (which is why two people shouldn't work the same layer at once). That's the one thing it won't guess. Then it tells you to ask in chat; your work stays safe on your machine."/>
+        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Stale world: Workbench only reads files when it LOADS. Foreman refuses to start/ship while it's open, so you never build on yesterday's map.&#10;•  Save-churn: every save re-serializes the '.ttile' for all ~1,155 tiles, and a 'Generate normal/vegetation map' rewrites every '_normal', even if you touched one tile. Shipping that bloats the repo and collides with everyone. Foreman ships the tiles you actually WORKED — sculpted (a '.bterr' change) or painted (a '_layer' change) — and drops the pure serialize/normal-regen churn; each machine rebuilds those locally.&#10;•  The unmergeable index: map/resourceDatabase.rdb can never merge between two people. Foreman keeps it out of your commits entirely; Workbench rebuilds it on your machine.&#10;•  Lost work: before SHIP (or START, or a stick tap) pushes, repairs or drops anything, Foreman backs up your whole session, every changed file except tile noise: once on this PC and once on GitHub (a hidden backup, not a branch). While Foreman is open it also backs up any unshipped work every 30 minutes, so even a dead PC loses half an hour at most. No backup, no ship. Then the only layer edits it leaves out are pure re-saves whose content is IDENTICAL to master's; any real change, like a moved road point or a nudged building, ships, whoever's name is on the layer. (Before v0.26 it judged by entity count, which silently dropped moved road points and nudges: that is how road fixes on Mike's side were lost in October.) Something missing after a ship? It's in a backup: see the README, 'Getting work back'.&#10;•  Prefab loss: if an addon the map depends on (the Fireforce props pack, usually) is missing or out of date on your computer, Workbench cannot find those prefabs and quietly STRIPS them from the layer when it saves - the objects stay but turn into invisible empty entities, and some (destructible walls and roofs) vanish. Shipping that wipes the objects for everyone; it cost the plantation and the station on 08/19 and 09/17. Doctor and START SESSION now name any prefab folder they can not find, and Foreman's PREFAB GUARD checks EVERY layer you changed (your own included) before it ships: it offers to REPAIR the links from the team copy on master, or DISCARD your edits to that layer, and there is no ship-anyway. Fix it at the source - update the addon, then START SESSION.&#10;•  Ship collisions: if a teammate shipped seconds before you, Foreman slots their work underneath yours automatically (different tiles = different files, they just merge). Even when you both re-saved the shared index files (the terrain header, tile-ownership map, resource index), Foreman auto-resolves them the proven way — master wins, Workbench rebuilds them on your next save, and it names every file it merged in the Activity log. And if you both changed the same world LAYER, Foreman (v0.29) combines the two: it keeps everyone's changes only after checking, entity by entity, that the result is exactly the layer plus both people's edits, with no two objects sharing a name (that crashes Workbench). If one side was just a Workbench re-save, it keeps the other. It stops dead ONLY when you both changed the very same objects, or the same terrain tile (two sculpts of one spot can't be combined). That's the one thing it won't guess. Then it tells you to ask in chat; your work stays safe on your machine."/>
 
         <TextBlock Text="THE RULES (short version)" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
-        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Work the layers of the area you're working, whatever name is on them; TAP IN before you touch a base layer.&#10;•  Positions come from the plan (world_coords.json / the 1:50k sheet) — don't invent locations.&#10;•  Foreman says '[STOP] CONFLICT'? Two people changed the same file. Your work is committed on your machine and safe. STOP and ask in the group chat — a human picks how to combine them. Once they've landed the combined version, just press START SESSION: Foreman sees your work is already on the team map and syncs to it by itself.&#10;•  Not merged = not done. Ship small and often."/>
+        <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,10" Text="•  Work the layers of the area you're working, whatever name is on them; TAP IN before you touch a base layer.&#10;•  Positions come from the plan (world_coords.json / the 1:50k sheet) — don't invent locations.&#10;•  Heads-up pop-ups (Windows notifications): Foreman tells you when a teammate is changing, or just shipped, a layer or tile you're also changing, and nudges you after 3 hours of unshipped work. When one pops up, ship soon or agree in chat who goes first. It's how clashes stay small.&#10;•  Foreman says '[STOP] CONFLICT'? You and a teammate changed the very same objects (or the same terrain tile), so it couldn't combine them by itself. Your work is committed on your machine and safe. STOP and ask in the group chat — a human picks how to combine them. Once they've landed the combined version, just press START SESSION: Foreman sees your work is already on the team map and syncs to it by itself.&#10;•  Not merged = not done. Ship small and often."/>
 
         <TextBlock Text="TROUBLESHOOTING" Foreground="#a8b5a0" FontWeight="Bold" Margin="0,6,0,4"/>
         <TextBlock Foreground="#cfd6c8" TextWrapping="Wrap" Margin="0,0,0,4" Text="•  A [STOP] message names its own fix — read it first.&#10;•  'No changes seen' but you definitely built? Workbench was editing a DUPLICATE copy, not your clone — run Doctor (it checks the link Workbench reads, which Foreman sets up by itself on every launch) and ask for help.&#10;•  Workbench shows an old map? Close it fully and reopen — and always START SESSION before opening it.&#10;•  Anything else weird: screenshot + group chat. Never push through a warning."/>
@@ -3728,14 +4031,18 @@ $timer.Add_Tick({
     # every 30 s: base-layer early warning; every 5 min: refresh who holds the stick (background fetch)
     $script:TickCount++
     if ($script:TickCount % 6 -eq 0) { try { Test-GateEarlyWarning } catch { } }
+    if ($script:TickCount % 12 -eq 0) { try { Test-HeadsUp } catch { } }     # v0.29: own presence + ship-soon nudge, every minute
     try {
         $fp = $script:FetchProc
         if ($fp -and $fp.HasExited) {
             $script:FetchProc = $null
             Refresh-Stick
             Refresh-Header
+            try { Test-HeadsUp -AfterFetch } catch { }                           # v0.29: shipped-under-you + teammate overlap
         } elseif (-not $fp -and $script:TickCount % 60 -eq 0) {
-            $script:FetchProc = Start-GitBackground @('fetch', 'origin', '--quiet')
+            $fa = @('fetch', 'origin', '--quiet')
+            if ((Get-WarnCfg).Presence) { $fa += @('+refs/heads/*:refs/remotes/origin/*', "+$((Get-WarnCfg).Prefix)/*:refs/foreman-presence/*") }
+            $script:FetchProc = Start-GitBackground $fa
         }
     } catch { }
 })
@@ -3780,6 +4087,237 @@ function Test-GateEarlyWarning {
     try {
         [System.Windows.MessageBox]::Show($msg, 'BUSHWAR Foreman - base layer in use', 'OK', 'Warning', 'OK', 'DefaultDesktopOnly') | Out-Null
     } finally { $script:GateBoxOpen = $false }
+}
+
+# HEADS-UP WARNINGS (v0.29): Windows notifications that catch an overlap while it's small.
+# chazman69, 2026-11-11, after Joe's park and Hyrax's riverbed clashed twice in one night:
+# "the notifications or warnings would be good popping up in a small window using
+# notifications systems in windows". Three of them, each shown once:
+#  1. a teammate just SHIPPED a layer or terrain tile you're also changing (seen at the
+#     5-minute background fetch);
+#  2. a teammate has UNSHIPPED edits in a layer or tile you're also changing. Every Foreman
+#     publishes the layers/tiles it has changed as refs/presence/<git name> (one tiny text
+#     file, a commit with no parent - not a branch), at most every 15 min or when the list
+#     changes; the background fetch reads everyone else's;
+#  3. you've had unshipped work for warnings.shipNudgeHours (default 3) - ship small and often.
+# Everything also goes in the Activity log. Off for the team: "warnings" in
+# foreman.config.json; off on one PC: "toasts": false in local.json.
+function Get-WarnCfg {
+    $c = @{ Toasts = $true; Presence = $true; Prefix = 'refs/presence'; MaxHours = 12; NudgeHours = 3.0 }
+    if ($script:Cfg -and $script:Cfg.PSObject.Properties['warnings']) {
+        $w = $script:Cfg.warnings
+        if ($w.PSObject.Properties['toasts']) { $c.Toasts = [bool]$w.toasts }
+        if ($w.PSObject.Properties['presence']) { $c.Presence = [bool]$w.presence }
+        if ($w.PSObject.Properties['presenceRefPrefix'] -and $w.presenceRefPrefix) { $c.Prefix = ([string]$w.presenceRefPrefix).TrimEnd('/') }
+        if ($w.PSObject.Properties['presenceMaxHours'] -and [int]$w.presenceMaxHours -gt 0) { $c.MaxHours = [int]$w.presenceMaxHours }
+        if ($w.PSObject.Properties['shipNudgeHours']) { $c.NudgeHours = [double]$w.shipNudgeHours }
+    }
+    if ($script:Local -and $script:Local.PSObject.Properties['toasts'] -and $script:Local.toasts -eq $false) { $c.Toasts = $false }
+    return $c
+}
+
+$script:ToastAppId = 'BUSHWAR.Foreman'
+$script:ToastReady = $null
+$script:TrayIcon = $null
+function Initialize-Toasts {
+    # registers "BUSHWAR Foreman" as a notification sender for this Windows user (HKCU only)
+    if ($null -ne $script:ToastReady) { return $script:ToastReady }
+    $script:ToastReady = $false
+    try {
+        $key = "HKCU:\Software\Classes\AppUserModelId\$script:ToastAppId"
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        Set-ItemProperty -Path $key -Name DisplayName -Value 'BUSHWAR Foreman'
+        $png = Join-Path $script:ForemanRoot 'assets\bw-mark.png'
+        if (Test-Path $png) { Set-ItemProperty -Path $key -Name IconUri -Value $png }
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+        $script:ToastReady = $true
+    } catch { }
+    return $script:ToastReady
+}
+
+function Show-Toast([string]$title, [string]$body) {
+    Log "[HEADS-UP] $title $body"
+    if (-not (Get-WarnCfg).Toasts) { return }
+    try {
+        if (Initialize-Toasts) {
+            $e = [System.Security.SecurityElement]
+            $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+            $xml.LoadXml("<toast duration=`"long`"><visual><binding template=`"ToastGeneric`"><text>$($e::Escape($title))</text><text>$($e::Escape($body))</text></binding></visual></toast>")
+            $t = [Windows.UI.Notifications.ToastNotification]::new($xml)
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($script:ToastAppId).Show($t)
+            return
+        }
+    } catch { }
+    try {
+        # older Windows / toasts unavailable: a tray balloon (Windows 10/11 show it as a notification too)
+        if (-not $script:TrayIcon) {
+            $script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
+            $ico = Join-Path $script:ForemanRoot 'assets\icon.ico'
+            if (Test-Path $ico) { $script:TrayIcon.Icon = New-Object System.Drawing.Icon $ico } else { $script:TrayIcon.Icon = [System.Drawing.SystemIcons]::Information }
+            $script:TrayIcon.Text = 'BUSHWAR Foreman'
+        }
+        $script:TrayIcon.Visible = $true
+        $script:TrayIcon.ShowBalloonTip(15000, $title, $body, [System.Windows.Forms.ToolTipIcon]::Warning)
+    } catch { }
+}
+
+function Get-MyEditingFiles {
+    # the layers and sculpted terrain tiles this PC has changed and not shipped: working tree
+    # (pure Workbench re-saves of a layer left out) plus commits that never reached origin
+    $repo = $script:MapRepo
+    $set = @{}
+    # Run-Git folds stderr (CRLF warnings) into .Out, so keep only lines that are repo paths
+    $isPath = '^[^\s+:*?"<>|][^:*?"<>|]*\.(layer|bterr)$'
+    $q = @('-c', 'core.quotepath=off', '-c', 'core.safecrlf=false')
+    $out = (Run-Git $repo ($q + @('diff', '--name-only', 'HEAD', '--', '*.layer', '*.bterr'))).Out
+    $new = (Run-Git $repo ($q + @('ls-files', '--others', '--exclude-standard', '--', '*.layer', '*.bterr'))).Out
+    foreach ($p in @((@($out, $new) -join "`n") -split "`r?`n" | Where-Object { $_ -match $isPath })) {
+        if ($p -like '*.layer' -and (Test-LayerIsChurn $p)) { continue }
+        $set[$p] = 1
+    }
+    $ah = (Run-Git $repo ($q + @('diff', '--name-only', "origin/$($script:Cfg.defaultBranch)...HEAD", '--', '*.layer', '*.bterr'))).Out
+    foreach ($p in @($ah -split "`r?`n" | Where-Object { $_ -match $isPath })) { $set[$p] = 1 }
+    return @($set.Keys | Sort-Object)
+}
+
+function Get-ShortName([string]$path) {
+    # "map/.../Joe_Vegetation.layer" -> "Joe_Vegetation.layer"; "...GrandReef_808.bterr" -> "terrain tile 808"
+    $leaf = Split-Path $path -Leaf
+    if ($leaf -match '_(\d+)\.bterr$') { return "terrain tile $($Matches[1])" }
+    return $leaf
+}
+
+$script:PresenceLast = $null
+$script:PresenceAt = [datetime]::MinValue
+$script:PresenceProc = $null
+function Publish-Presence([string[]]$files) {
+    # refs/presence/<git name>: a parentless commit holding editing.txt. Pushed in the
+    # background; skipped while the last push is still going or nothing changed (<15 min).
+    $wc = Get-WarnCfg
+    if (-not $wc.Presence) { return }
+    $p = $script:PresenceProc
+    if ($p -and -not $p.HasExited) { return }
+    if ($p) { $script:PresenceProc = $null; if ($p.ExitCode -ne 0) { $script:PresenceLast = $null } }   # failed: try again next time
+    $key = ($files -join "`n")
+    if ($key -eq $script:PresenceLast -and (((Get-Date) - $script:PresenceAt).TotalMinutes -lt 15 -or -not $files)) { return }
+    $repo = $script:MapRepo
+    $lines = @("name: $(Get-MyName)", "updated: $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))")
+    $lines += @($files | ForEach-Object { "file: $_" })
+    $tmpTxt = Join-Path $env:TEMP "foreman-presence-$PID.txt"
+    $tmpIdx = Join-Path $env:TEMP "foreman-presence-$PID.index"
+    $oldIdx = $env:GIT_INDEX_FILE
+    try {
+        [System.IO.File]::WriteAllText($tmpTxt, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        $blob = (Run-Git $repo @('hash-object', '-w', '--no-filters', $tmpTxt)).Out
+        if ($blob -notmatch '^[0-9a-f]{40}$') { return }
+        $env:GIT_INDEX_FILE = $tmpIdx
+        Run-Git $repo @('update-index', '--add', '--cacheinfo', "100644,$blob,editing.txt") | Out-Null
+        $tree = (Run-Git $repo @('write-tree')).Out
+        $env:GIT_INDEX_FILE = $oldIdx
+        if ($tree -notmatch '^[0-9a-f]{40}$') { return }
+        $c = (Run-Git $repo @('commit-tree', $tree, '-m', "presence: $(Get-MyName)")).Out
+        if ($c -notmatch '^[0-9a-f]{40}$') { return }
+        $script:PresenceProc = Start-GitBackground @('push', '--quiet', '--no-verify', '--force', 'origin', "$($c):$($wc.Prefix)/$(Get-BackupOwner)")
+        $script:PresenceLast = $key
+        $script:PresenceAt = Get-Date
+    } catch {
+    } finally {
+        $env:GIT_INDEX_FILE = $oldIdx
+        Remove-Item -LiteralPath $tmpTxt, $tmpIdx -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-TeamPresence {
+    # everyone else's refs/presence/* as fetched by the background fetch, newer than presenceMaxHours
+    $repo = $script:MapRepo
+    $wc = Get-WarnCfg
+    $me = Get-BackupOwner
+    $res = @()
+    $refs = (Run-Git $repo @('for-each-ref', '--format=%(refname)', 'refs/foreman-presence/')).Out
+    foreach ($ref in @($refs -split "`r?`n" | Where-Object { $_ })) {
+        if ((Split-Path $ref -Leaf) -ieq $me) { continue }
+        $t = (Run-Git $repo @('show', "$($ref):editing.txt")).Out
+        if (-not $t) { continue }
+        $name = Split-Path $ref -Leaf; $when = $null; $files = @()
+        foreach ($l in ($t -split "`r?`n")) {
+            if ($l -match '^name:\s*(.+)$') { $name = $Matches[1].Trim() }
+            elseif ($l -match '^updated:\s*(\S+)') { try { $when = [datetime]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal) } catch { } }
+            elseif ($l -match '^file:\s*(.+)$') { $files += $Matches[1].Trim() }
+        }
+        if (-not $when -or ((Get-Date).ToUniversalTime() - $when).TotalHours -gt $wc.MaxHours) { continue }
+        $res += @{ Name = $name; When = $when; Files = $files }
+    }
+    return $res
+}
+
+function Format-Ago([datetime]$utc) {
+    $m = [int]((Get-Date).ToUniversalTime() - $utc).TotalMinutes
+    if ($m -lt 2) { return 'just now' }
+    if ($m -lt 90) { return "$m min ago" }
+    return "$([math]::Round($m / 60.0, 1)) h ago"
+}
+
+$script:HeadsUpSeen = @{}
+$script:DirtySince = $null
+$script:NudgedAt = [datetime]::MinValue
+$script:InBusy = $false
+function Test-HeadsUp([switch]$AfterFetch) {
+    if ($script:InBusy) { return }
+    $repo = $script:MapRepo
+    $branch = $script:Cfg.defaultBranch
+    $wc = Get-WarnCfg
+    $mine = @(Get-MyEditingFiles)
+    Publish-Presence $mine
+    if ($mine.Count -eq 0) { $script:DirtySince = $null; return }
+    if (-not $script:DirtySince) {
+        # oldest change still waiting to ship (survives a Foreman restart)
+        $script:DirtySince = Get-Date
+        foreach ($p in $mine) {
+            try { $t = (Get-Item -LiteralPath (Join-Path $repo $p) -ErrorAction Stop).LastWriteTime; if ($t -lt $script:DirtySince) { $script:DirtySince = $t } } catch { }
+        }
+    }
+    $mineSet = @{}
+    foreach ($p in $mine) { $mineSet[$p] = 1 }
+    if ($AfterFetch) {
+        # 1. shipped under you
+        $byWho = @{}
+        $log = (Run-Git $repo @('log', '--format=@@%h|%an', '--name-only', "HEAD..origin/$branch", '--', '*.layer', '*.bterr')).Out
+        $cur = $null
+        foreach ($l in @($log -split "`r?`n")) {
+            if ($l -match '^@@([0-9a-f]+)\|(.*)$') { $cur = @{ Sha = $Matches[1]; Who = $Matches[2] }; continue }
+            if (-not $cur -or -not $l -or -not $mineSet.ContainsKey($l)) { continue }
+            $k = "ship|$($cur.Sha)|$l"
+            if ($script:HeadsUpSeen.ContainsKey($k)) { continue }
+            $script:HeadsUpSeen[$k] = 1
+            if (-not $byWho.ContainsKey($cur.Who)) { $byWho[$cur.Who] = @() }
+            if ($byWho[$cur.Who] -notcontains $l) { $byWho[$cur.Who] += $l }
+        }
+        foreach ($who in $byWho.Keys) {
+            $names = ($byWho[$who] | ForEach-Object { Get-ShortName $_ }) -join ', '
+            $tiles = @($byWho[$who] | Where-Object { $_ -like '*.bterr' }).Count -gt 0
+            $body = if ($tiles) { "$names. Two people's sculpts on one tile can't be combined: sort out in chat who keeps theirs, before you ship." } else { "$names. When you SHIP, Foreman will try to combine your work with theirs. Ship soon so the overlap stays small." }
+            Show-Toast "$who just shipped something you're also changing" $body
+        }
+        # 2. a teammate is changing the same thing right now (unshipped)
+        foreach ($pp in @(Get-TeamPresence)) {
+            $hit = @($pp.Files | Where-Object { $mineSet.ContainsKey($_) -and -not $script:HeadsUpSeen.ContainsKey("pres|$($pp.Name)|$_") })
+            if ($hit.Count -eq 0) { continue }
+            foreach ($f in $hit) { $script:HeadsUpSeen["pres|$($pp.Name)|$f"] = 1 }
+            $names = ($hit | ForEach-Object { Get-ShortName $_ }) -join ', '
+            $tiles = @($hit | Where-Object { $_ -like '*.bterr' }).Count -gt 0
+            $tail = if ($tiles) { "Sculpts on one tile can't be combined: agree in chat who goes first." } else { 'Ship soon, or agree in chat who goes first.' }
+            Show-Toast "$($pp.Name) is changing the same thing" "$names also has unshipped edits on $($pp.Name)'s PC (updated $(Format-Ago $pp.When)). $tail"
+        }
+    }
+    # 3. ship-soon nudge
+    if ($wc.NudgeHours -gt 0) {
+        $age = ((Get-Date) - $script:DirtySince).TotalHours
+        if ($age -ge $wc.NudgeHours -and ((Get-Date) - $script:NudgedAt).TotalHours -ge $wc.NudgeHours) {
+            $script:NudgedAt = Get-Date
+            Show-Toast 'Time to ship?' "You've had unshipped work for $([math]::Floor($age)) hours. Shipping small and often keeps clashes with teammates small. (Close Workbench, then SHIP SESSION.)"
+        }
+    }
 }
 
 # AUTO-BACKUP (v0.26): every backup.autoMinutes while Foreman is open, unshipped work is
@@ -4529,3 +5067,4 @@ $window.Add_ContentRendered({
     }
 })
 $window.ShowDialog() | Out-Null
+if ($script:TrayIcon) { try { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() } catch { } }

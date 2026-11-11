@@ -38,6 +38,14 @@
     "keepPerPerson": 60,
     "autoMinutes": 30
   },
+  "autoCombineLayers": true,
+  "warnings": {
+    "toasts": true,
+    "presence": true,
+    "presenceRefPrefix": "refs/presence",
+    "presenceMaxHours": 12,
+    "shipNudgeHours": 3
+  },
   "diagnostics": {
     "remoteRefPrefix": "refs/diag",
     "keepPerPerson": 10,
