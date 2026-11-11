@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:ForemanVersion = '0.28.1'
+$script:ForemanVersion = '0.28.2'
 $script:ForemanRoot = Split-Path -Parent $PSScriptRoot   # repo root (src\..)
 
 # ------------------------------------------------------------- taskbar identity
@@ -376,6 +376,21 @@ function Get-SteamLibraries {
             }
         }
     } catch { }
+    # v0.28.2: the machine-wide Steam path too (HKCU can be missing or stale)
+    foreach ($k in @('HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam')) {
+        try {
+            $ip = (Get-ItemProperty $k -ErrorAction Stop).InstallPath
+            if ($ip) {
+                $libs += $ip
+                $vdf = Join-Path $ip 'steamapps\libraryfolders.vdf'
+                if (Test-Path $vdf) {
+                    foreach ($m in [regex]::Matches((Get-Content $vdf -Raw), '"path"\s+"([^"]+)"')) {
+                        $libs += ($m.Groups[1].Value -replace '\\\\', '\')
+                    }
+                }
+            }
+        } catch { }
+    }
     foreach ($pf in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) { if ($pf) { $libs += (Join-Path $pf 'Steam') } }
     $seen = @{}
     $out = @()
@@ -411,12 +426,35 @@ $script:BaseGameGuid = '58D0FB3206B6F859'   # ArmaReforger.gproj, the base game 
 # addons, so Foreman's direct launch died while the project list worked. Foreman now
 # passes -addonsDir with the game's addons folder when Tools has no base game of its own.
 function Find-GameAddonsDir {
-    # the Arma Reforger (game) install's addons folder, when it holds the base game
-    foreach ($lib in (Get-SteamLibraries)) {
-        $a = Join-Path $lib 'steamapps\common\Arma Reforger\addons'
+    # the Arma Reforger (game) install's addons folder, when it holds the base game.
+    # v0.28.2: also Steam's own uninstall entry for the game (app 1874880), which names the
+    # install folder even when the library isn't in HKCU/libraryfolders.vdf (a builder's
+    # direct launch still went out without -addonsDir, 2026-11-10).
+    $dirs = @()
+    foreach ($lib in (Get-SteamLibraries)) { $dirs += (Join-Path $lib 'steamapps\common\Arma Reforger') }
+    foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1874880',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1874880')) {
+        try { $il = (Get-ItemProperty $k -ErrorAction Stop).InstallLocation; if ($il) { $dirs += $il } } catch { }
+    }
+    foreach ($d in $dirs) {
+        $a = Join-Path $d 'addons'
         if (Test-Path -LiteralPath (Join-Path $a 'data\ArmaReforger.gproj')) { return $a }
     }
     return $null
+}
+
+function Test-ToolsHasBaseGame {
+    param([string]$Exe)
+    return (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Exe) 'addons\data\ArmaReforger.gproj'))
+}
+
+function Test-BaseGameMissing {
+    # Tools ships without the base game AND the game install can't be found: a direct launch
+    # can only end in "Can't find '58D0...' game addon"
+    param([string]$Exe)
+    if (-not $Exe) { return $false }
+    if (Test-ToolsHasBaseGame -Exe $Exe) { return $false }
+    return (-not (Find-GameAddonsDir))
 }
 
 function Get-WorkbenchAddonsDirs {
@@ -580,6 +618,16 @@ function Open-Workbench {
     $exe = Find-WorkbenchExe
     if (-not $exe) {
         return @{ State = 'notfound'; Line = "[WARN] Foreman couldn't find Arma Reforger Tools. Open it from Steam yourself and choose Grand Reef. Press Doctor if it isn't installed." }
+    }
+    if (Test-BaseGameMissing -Exe $exe) {
+        # v0.28.2: a direct launch would only end in "Can't find '58D0...' game addon"; the
+        # project list uses the launcher's own game folder setting, so open that instead
+        try {
+            Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -ErrorAction Stop | Out-Null
+        } catch {
+            return @{ State = 'failed'; Line = "[WARN] Workbench didn't open ($($_.Exception.Message)). Open it from Steam yourself and choose Grand Reef." }
+        }
+        return @{ State = 'launcher'; Line = "[WARN] Foreman can't find Arma Reforger (the game) on this PC, and Workbench needs its base game, so the project list is opening instead: pick Grand Reef. If Workbench then says it can't find '58D0FB3206B6F859', install Arma Reforger in Steam. Press Doctor and post the report." }
     }
     if (Test-WorkbenchNeedsLauncher) {
         # a recent direct launch couldn't start the engine on this PC; the project list can
@@ -2898,12 +2946,14 @@ function Invoke-Doctor([switch]$Interactive) {
     if ($wbExe -and (Test-WorkbenchNeedsLauncher)) {
         $results += "[WARN] Workbench's last start on this PC failed with 'Can't initialize engine'. The usual cause is a missing addon - the map's own, or one a pack needs (Workbench's log lines below name it; download it from the Workshop). Otherwise Steam > Library > Arma Reforger Tools (not Experimental) > Properties > Installed Files > Verify integrity. Until then START SESSION opens the project list: pick Grand Reef there."
         try { foreach ($fl in @(Get-LaunchFailureLines @(Get-NewestMapLogText))) { $results += "[INFO]   Workbench's log: $fl" } } catch { }
+        try { if (Test-BaseGameMissing -Exe $wbExe) { $results += "[FAIL] Arma Reforger (the game) wasn't found on this PC, and Workbench needs its base game (the 'Can't find 58D0FB3206B6F859 game addon' box). Install Arma Reforger in Steam, or if it's on another drive, post this report. Tools is at: $(Split-Path -Parent $wbExe)" } } catch { }
     }
     elseif ($wbExe) {
         $results += '[OK]   Arma Reforger Tools is installed (START SESSION opens it on the map for you)'
         try {
             $la = @(Get-WorkbenchLaunchArgs -Exe $wbExe -Gproj 'x')
             if ($la -contains '-addonsDir') { $results += "[OK]   Base game found in the Arma Reforger install ($(Find-GameAddonsDir)) - Foreman points Workbench at it" }
+            elseif (Test-BaseGameMissing -Exe $wbExe) { $results += "[FAIL] Arma Reforger (the game) wasn't found on this PC, and Workbench needs its base game (this is the 'Can't find 58D0FB3206B6F859 game addon' box). Install Arma Reforger in Steam, or if it's on another drive, post this report so Foreman can be taught where. Tools is at: $(Split-Path -Parent $wbExe)" }
         } catch { }
     }
     else { $results += "[WARN] Couldn't find Arma Reforger Tools in Steam. Install it (Steam > Library > Tools), or open it yourself after START SESSION." }
@@ -4268,6 +4318,17 @@ if ($SmokeTest) {
     New-Item -ItemType Directory -Path (Join-Path $toolsA 'data') -Force | Out-Null
     'GameProject { GUID "58D0FB3206B6F859" }' | Out-File (Join-Path $toolsA 'data\ArmaReforger.gproj') -Encoding ascii
     $adToolsHas = @(Get-WorkbenchAddonsDirs -ToolsAddons $toolsA -GameAddons $gameA -DocsAddons $docsA)
+    # v0.28.2: Tools with the base game is never "missing"; Tools without it is, unless the game is found
+    $fakeExe = Join-Path (Split-Path -Parent $toolsA) 'ArmaReforgerWorkbenchSteamDiag.exe'
+    $bgHas = Test-BaseGameMissing -Exe $fakeExe
+    Remove-Item (Join-Path $toolsA 'data') -Recurse -Force
+    $bgLacks = Test-BaseGameMissing -Exe $fakeExe
+    $bgExpect = (-not (Find-GameAddonsDir))
+    Write-Host "SMOKE: base game missing -> tools-has=$bgHas tools-lacks=$bgLacks (expect False/$bgExpect)"
+    if ($bgHas -or $bgLacks -ne $bgExpect) {
+        Write-Host 'SMOKE: BASE GAME CHECK FAILED'
+        exit 1
+    }
     Remove-Item $adT -Recurse -Force -ErrorAction SilentlyContinue
     $cliOld = '12:53:58.342   ENGINE       : CLI Params: -gproj C:\x\Grand Reef\addon.gproj '
     $cliNew = '12:53:58.342   ENGINE       : CLI Params: -gproj C:\x\Grand Reef\addon.gproj -addonsDir C:\a,C:\b '
