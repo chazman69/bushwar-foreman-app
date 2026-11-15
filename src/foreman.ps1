@@ -203,7 +203,13 @@ function Test-IsMapProjectFolder([string]$dir) {
     $guid = $script:Cfg.addonGuid
     if (-not $guid) { return $true }   # no GUID configured (other project), name test only
     try { $text = Get-Content -LiteralPath $gproj -Raw -ErrorAction Stop } catch { return $false }
-    return ($text -match [regex]::Escape($guid))
+    # The addon's OWN GUID is the first top-level GUID line (before Dependencies { ... }).
+    # Matching the GUID anywhere in the file flagged any addon that merely DEPENDS on the
+    # map (Project Fireforce lists Grand Reef as a dependency), and Doctor then offered to
+    # move that real project out of Workbench on every launch.
+    $own = [regex]::Match($text, '(?m)^\s*GUID\s+"([0-9A-Fa-f]+)"')
+    if (-not $own.Success) { return $false }
+    return ($own.Groups[1].Value -ieq $guid)
 }
 
 function Resolve-RepoFromJunctionTarget([string]$t) {
@@ -4882,9 +4888,13 @@ if ($SmokeTest) {
     $dMap = Join-Path $tmpRoot 'MapCopy'
     $dDep = Join-Path $tmpRoot 'BushwarPack3'
     $dNone = Join-Path $tmpRoot 'NoProject'
-    New-Item -ItemType Directory -Path $dMap, $dDep, $dNone -Force | Out-Null
+    $dUses = Join-Path $tmpRoot 'DependsOnMap'
+    New-Item -ItemType Directory -Path $dMap, $dDep, $dNone, $dUses -Force | Out-Null
     "GameProject {`r`n GUID `"$($script:Cfg.addonGuid)`"`r`n}" | Out-File (Join-Path $dMap 'addon.gproj') -Encoding utf8
     "GameProject {`r`n GUID `"652412D10AC38900`"`r`n}" | Out-File (Join-Path $dDep 'addon.gproj') -Encoding utf8
+    # an addon with its own GUID that lists the map as a DEPENDENCY must not count as a map copy
+    "GameProject {`r`n GUID `"699B434E901C6807`"`r`n Dependencies {`r`n  `"$($script:Cfg.addonGuid)`"`r`n }`r`n}" | Out-File (Join-Path $dUses 'addon.gproj') -Encoding utf8
+    $dupUses = Test-IsMapProjectFolder $dUses
     $dupMap = Test-IsMapProjectFolder $dMap
     $dupDep = Test-IsMapProjectFolder $dDep
     $dupNone = Test-IsMapProjectFolder $dNone
@@ -4982,8 +4992,8 @@ if ($SmokeTest) {
         Write-Host "SMOKE: MAP DEPENDENCY CHECK THREW: $($_.Exception.Message)"
         exit 1
     }
-    Write-Host "SMOKE: dupe test -> map-copy=$dupMap dependency=$dupDep no-gproj=$dupNone (expect True/False/False)"
-    if (-not $dupMap -or $dupDep -or $dupNone) {
+    Write-Host "SMOKE: dupe test -> map-copy=$dupMap dependency=$dupDep no-gproj=$dupNone depends-on-map=$dupUses (expect True/False/False/False)"
+    if (-not $dupMap -or $dupDep -or $dupNone -or $dupUses) {
         Write-Host 'SMOKE: DEPENDENCY SAFETY FAILED'
         exit 1
     }
